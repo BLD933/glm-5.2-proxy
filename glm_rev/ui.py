@@ -3,30 +3,93 @@
 Inspired by claude-rev's ui.py: streaming markdown-lite ANSI rendering,
 slash commands, persistent conversation state, and transcript export.
 """
-import asyncio
 import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
-import requests
 
-from .config import BASE, ENDPOINT
-from .api import sign, headers, user_id_from_token
-from .client import refresh_token, create_chat, build_features
-from .solver import CaptchaSolver, steal_captcha
+from .config import BASE, ENDPOINT, LOCAL_TOOL_NAMES, load_allowlist, save_allowlist
+from .api import sign, user_id_from_token
+from .client import refresh_token, create_chat, build_features, stream_turn
+from .solver import CaptchaSolver, solve_fresh, register_solver
+from .tools import send_with_tools
+from .mcp import MCPManager, load_mcp_config
+from .render import ReasoningStream
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-SLASH_COMMANDS = ["clear", "effort", "export", "help", "history", "max",
-                  "model", "models", "new", "pretty", "search", "status",
-                  "temp", "think", "usage"]
+SLASH_COMMANDS = ["allow", "clear", "effort", "export", "help", "history",
+                  "max", "mcp", "model", "models", "new", "pretty", "search",
+                  "status", "temp", "think", "tools", "usage"]
 
 ANSI = {
     "reset": "\x1b[0m", "bold": "\x1b[1m", "dim": "\x1b[2m", "underline": "\x1b[4m",
     "green": "\x1b[32m", "yellow": "\x1b[33m", "blue": "\x1b[34m", "cyan": "\x1b[36m",
+    "red": "\x1b[31m", "magenta": "\x1b[35m",
 }
+
+
+def _color(enabled, key, text):
+    if not enabled:
+        return text
+    return f"{ANSI[key]}{text}{ANSI['reset']}"
+
+
+def st_note(msg, enabled=True):
+    """Status/progress line -> stderr, dim."""
+    print(_color(enabled, "dim", msg), file=sys.stderr)
+
+
+def st_ok(msg, enabled=True):
+    """Success line -> stderr, green."""
+    print(_color(enabled, "green", msg), file=sys.stderr)
+
+
+def st_warn(msg, enabled=True):
+    """Non-fatal warning line -> stderr, yellow."""
+    print(_color(enabled, "yellow", msg), file=sys.stderr)
+
+
+def st_err(msg, enabled=True):
+    """Error line -> stderr, red."""
+    print(_color(enabled, "red", msg), file=sys.stderr)
+
+
+class working:
+    """Progress beacon: prints an elapsed-time line to stderr every `every` seconds
+    while a long blocking operation runs, so the UI never looks frozen."""
+
+    def __init__(self, msg, every=10, enabled=True):
+        self._msg = msg
+        self._every = every
+        self._enabled = enabled
+        self._stop = threading.Event()
+        self._thr = None
+
+    def __enter__(self):
+        self._stop.clear()
+        self._thr = threading.Thread(target=self._run, daemon=True)
+        self._thr.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thr:
+            self._thr.join(timeout=2)
+
+    def stop(self):
+        """Stop the beacon immediately (e.g. once the first token arrives)."""
+        self._stop.set()
+        if self._thr:
+            self._thr.join(timeout=2)
+
+    def _run(self):
+        t0 = time.time()
+        while not self._stop.wait(self._every):
+            st_note(f"[*] {self._msg} — {int(time.time() - t0)}s...")
 
 MODEL_FALLBACK = [
     "glm-5.2", "GLM-5.1", "GLM-5-Turbo", "GLM-5v-Turbo", "glm-4.7",
@@ -69,16 +132,22 @@ class MDPrinter:
     """Streaming markdown-lite ANSI renderer — fence-aware across chunk boundaries.
     Falls back to raw passthrough when stdout is not a tty."""
 
-    def __init__(self, enabled=True):
+    def __init__(self, enabled=True, header=None):
         self.enabled = enabled and sys.stdout.isatty()
         self._buf = ""
         self._in_code = False
+        self._header = header
+        self._started = False
 
     def write(self, chunk):
         if not self.enabled:
             sys.stdout.write(chunk)
             sys.stdout.flush()
             return
+        if not self._started and chunk.strip():
+            self._started = True
+            if self._header:
+                print(self._header)
         self._buf += chunk
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
@@ -113,49 +182,7 @@ class MDPrinter:
 
 
 # --- captcha: single-use tokens require a fresh solve per completion request ---
-
-
-_DETAILS_RE = re.compile(r'<details type="reasoning"[^>]*>(.*?)</details>', re.S)
-
-
-def split_reasoning(text):
-    """Return (reasoning_or_None, answer_without_reasoning)."""
-    m = _DETAILS_RE.search(text)
-    if not m:
-        return None, text
-    reasoning = m.group(1).strip()
-    answer = (text[:m.start()] + text[m.end():]).strip()
-    return reasoning, answer
-
-
-def solve_fresh(solver, state, one_shot_attempts=3):
-    """Acquire a FRESH single-use captcha + cookie pair.
-
-    AliyunCaptcha tokens are single-use: re-sending an already-consumed token
-    to chat.completions triggers FRONTEND_CAPTCHA_REQUIRED (F018). This never
-    returns a stale token — it tries the warm solver, then up to
-    `one_shot_attempts` headless solves, and returns None only if all fail.
-    Updates state["captcha"]/["cookie"] in place on success."""
-    if solver is not None:
-        try:
-            captcha, cookie = solver.solve(state["token"])
-        except Exception:
-            captcha, cookie = None, None
-        if captcha:
-            state["captcha"], state["cookie"] = captcha, cookie
-            print("[*] fresh captcha from warm solver", file=sys.stderr)
-            return captcha, cookie
-    for i in range(one_shot_attempts):
-        try:
-            captcha, cookie = asyncio.run(steal_captcha(state["token"]))
-        except Exception:
-            captcha, cookie = None, None
-        if captcha:
-            state["captcha"], state["cookie"] = captcha, cookie
-            print(f"[*] fresh captcha from one-shot solve ({i + 1})", file=sys.stderr)
-            return captcha, cookie
-        print(f"[!] one-shot captcha solve attempt {i + 1} failed", file=sys.stderr)
-    return None
+# (solve_fresh now lives in solver.py; split_reasoning/stream_turn in client.py)
 
 
 def print_help():
@@ -175,6 +202,9 @@ def print_help():
     /export [file]     write transcript to markdown
     /pretty on|off     toggle colored markdown rendering (default: on, tty)
     /clear             clear on-screen transcript
+    /tools on|off|list toggle local + MCP tool execution
+    /allow <path>|url  add a path or domain to the tool allowlist
+    /mcp status|connect|disconnect|reload|allow|deny|tools   manage MCP servers
     /help              show this help
     exit|quit|q        quit
 """)
@@ -195,14 +225,20 @@ def fmt_status(state):
              + (f" (effort {state['reasoning_effort']})" if state["enable_thinking"] else ""))
     s.append(f"  web search: {'ON' if state['web_search'] else 'off'}")
     s.append(f"  temperature: {state['temperature']}  max_tokens: {state['max_tokens']}")
+    s.append(f"  tools: {'ON' if state.get('tools_on') else 'off'}"
+             + (f" ({state['mcp'].connected_count()} MCP server(s), "
+                f"{state['mcp'].tool_count()} tool(s))" if state.get("mcp") else ""))
     s.append(f"  chat: {state['chat_id'] or '(none — created on first prompt)'}")
     return "\n".join(s)
 
 
-def send_message(state, prompt, md, debug_sse=False):
+def send_message(state, prompt, md, debug_sse=False, on_token=None):
     """Send one prompt in the current conversation, streaming to stdout.
     Returns (ok, error). Updates state: chat_id, last_assistant_id,
     last_assistant_parent_id, history, usage.
+
+    `on_token` (optional) is invoked once when the first thinking or answer
+    delta arrives, so callers can stop a progress beacon mid-stream.
 
     Multi-turn threading follows the app's own request builder: for a follow-up
     the new user node attaches under the last assistant node, so the body sends
@@ -223,12 +259,8 @@ def send_message(state, prompt, md, debug_sse=False):
         chat_id = state["chat_id"]
 
     is_first = not state["history"]
-    if is_first:
-        current_user_msg_id = str(uuid.uuid4())
-        current_user_parent_id = None
-    else:
-        current_user_msg_id = state["last_assistant_id"]
-        current_user_parent_id = state["last_assistant_parent_id"]
+    current_user_msg_id = str(uuid.uuid4())
+    current_user_parent_id = None if is_first else state.get("last_assistant_id")
 
     sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
                                current_url=f"{BASE}/c/{chat_id}")
@@ -240,108 +272,57 @@ def send_message(state, prompt, md, debug_sse=False):
     if not fresh:
         return False, ("could not acquire a fresh captcha token "
                        "(warm + one-shot solve failed); please retry")
-    captcha, _ = fresh
 
-    def attempt(captcha):
-        body = {
-            "chat_id": chat_id,
-            "current_user_message_id": current_user_msg_id,
-            "current_user_message_parent_id": current_user_parent_id,
-            "extra": {},
-            "features": build_features(state["enable_thinking"], state["reasoning_effort"],
-                                       state["web_search"]),
-            "id": str(uuid.uuid4()),
-            "messages": body_messages,
-            "model": state["model"],
-            "params": {"max_tokens": state["max_tokens"],
-                       "temperature": state["temperature"], "top_p": 0.95},
-            "signature_prompt": prompt,
-            "stream": True,
-            "variables": {},
-            "captcha_verify_param": captcha,
-        }
-        if is_first:
-            body["background_tasks"] = {"title_generation": True, "tags_generation": True}
-        try:
-            resp = requests.post(url, headers=headers(token, sig, state["cookie"]),
-                                 json=body, stream=True, timeout=180)
-        except requests.exceptions.RequestException as e:
-            return None, f"upstream error: {e}"
-        if resp.status_code != 200:
-            return None, f"HTTP {resp.status_code}: {resp.text[:500]}"
+    def attempt(pair):
+        captcha, cookie = pair
+        rstream = ReasoningStream()
+        fired = {"token": False}
+        streamed = {"answer": False}
 
-        collected = []
-        new_id = state["last_assistant_id"]
-        new_parent = state["last_assistant_parent_id"]
-        usage = None
-        stream_error = None
-        captcha_error = None
-        stream_status = None
-        buf = []
-        thinking_len = 0
+        def _first_token(_d):
+            if not fired["token"]:
+                fired["token"] = True
+                if on_token is not None:
+                    on_token()
 
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            if debug_sse:
-                print(f"[sse] {data}", file=sys.stderr)
-            try:
-                j = json.loads(data)
-            except Exception:
-                continue
-            inner = j.get("data")
-            if not isinstance(inner, dict):
-                continue
-            phase = inner.get("phase")
-            delta = inner.get("delta_content")
-            edit_index = inner.get("edit_index")
-            edit_content = inner.get("edit_content")
-            if inner.get("id"):
-                new_id = inner["id"]
-            if inner.get("parent_message_id"):
-                new_parent = inner["parent_message_id"]
-            if inner.get("usage"):
-                usage = inner["usage"]
-            if inner.get("error"):
-                e = inner["error"]
-                code = e.get("code") if isinstance(e, dict) else None
-                if code == "FRONTEND_CAPTCHA_REQUIRED":
-                    captcha_error = e
-                elif stream_error is None:
-                    stream_error = e
-            if inner.get("status"):
-                stream_status = inner["status"]
+        def _on_answer(delta):
+            _first_token(delta)
             if delta:
-                buf.append(delta)
-                if phase == "thinking":
-                    thinking_len += len(delta)
-            elif edit_index is not None and edit_content is not None:
-                idx = int(edit_index)
-                cur = "".join(buf)
-                buf = [cur[:idx] + edit_content]
-                if idx < thinking_len:
-                    thinking_len = idx
+                streamed["answer"] = True
+                md.write(delta)
 
-        full = "".join(buf)
-        reasoning, text = split_reasoning(full)
-        if reasoning is None and thinking_len:
-            reasoning = full[:thinking_len].strip() or None
-            text = full[thinking_len:]
-        if reasoning:
+        res = stream_turn(token=token, cookie=cookie, sig=sig, url=url,
+                          chat_id=chat_id, model=state["model"],
+                          messages=body_messages,
+                          current_user_message_id=current_user_msg_id,
+                          current_user_message_parent_id=current_user_parent_id,
+                          is_first=is_first,
+                          features=build_features(state["enable_thinking"],
+                                                  state["reasoning_effort"],
+                                                  state["web_search"]),
+                          params={"max_tokens": state["max_tokens"],
+                                  "temperature": state["temperature"], "top_p": 0.95},
+                          captcha=captcha, debug_sse=debug_sse,
+                          on_thinking=lambda d: (rstream.write(d), _first_token(d)),
+                          on_answer=_on_answer)
+        if "error" in res:
+            return None, res["error"]
+        reasoning = res.get("reasoning")
+        if rstream.started:
+            rstream.finish()
+        elif reasoning:
             print(f"{ANSI['dim']}── reasoning ──{ANSI['reset']}", file=sys.stderr)
             for ln in reasoning.splitlines():
                 print(f"{ANSI['dim']}{ln}{ANSI['reset']}", file=sys.stderr)
             print(f"{ANSI['dim']}{'─' * 14}{ANSI['reset']}", file=sys.stderr)
-        text = text.strip()
-        if text:
+        text = (res.get("answer") or "").strip()
+        if text and not streamed["answer"]:
             md.write(text)
-        return (text, new_id, new_parent, usage, stream_error, stream_status,
-                captcha_error), None
+        return (text, res.get("id"), res.get("parent"), res.get("usage"),
+                res.get("stream_error"), res.get("stream_status"),
+                res.get("captcha_error")), None
 
-    detail, err = attempt(captcha)
+    detail, err = attempt(fresh)
     if err:
         return False, err
     text, new_id, new_parent, usage, stream_error, stream_status, captcha_error = detail
@@ -349,7 +330,7 @@ def send_message(state, prompt, md, debug_sse=False):
         print("[*] captcha rejected by server; re-solving...", file=sys.stderr)
         fresh = solve_fresh(state.get("solver"), state)
         if fresh:
-            detail, err = attempt(fresh[0])
+            detail, err = attempt(fresh)
             if err:
                 return False, err
             text, new_id, new_parent, usage, stream_error, stream_status, captcha_error = detail
@@ -384,7 +365,7 @@ def send_message(state, prompt, md, debug_sse=False):
 
 
 def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
-             debug_sse=False):
+             debug_sse=False, tools=False, no_mcp=False):
     """Interactive REPL loop."""
     state = {
         "token": token,
@@ -403,6 +384,8 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
         "captcha": None,
         "cookie": None,
         "solver": None,
+        "tools_on": tools,
+        "mcp": None,
     }
 
     print()
@@ -410,30 +393,44 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
     print("  ║  GLM interactive client (chat.z.ai)                 ║")
     print("  ╚════════════════════════════════════════════════════╝")
 
-    print("[*] warming captcha solver...", file=sys.stderr)
-    solver = CaptchaSolver()
-    captcha, cookie = None, None
+    st_note("[*] warming captcha solver in background (playwright)")
     try:
-        captcha, cookie = solver.start(token)
-    except Exception as e:
-        print(f"[!] warm solver unavailable ({e}); one-shot solve instead", file=sys.stderr)
-        try:
-            solver.close()
-        except Exception:
-            pass
-        solver = None
-        try:
-            captcha, cookie = asyncio.run(steal_captcha(token))
-        except Exception:
-            captcha, cookie = None, None
-    if not captcha:
-        print("[!] failed to acquire captcha token — /new may retry", file=sys.stderr)
-    state["captcha"], state["cookie"] = captcha, cookie
+        register_solver(None, token)
+    except Exception:
+        pass
+    solver = CaptchaSolver()
+    solver.start_background(token)
     state["solver"] = solver
 
+    mcp = None
+    if not no_mcp:
+        try:
+            cfg = load_mcp_config()
+            if cfg:
+                st_note(f"[*] connecting {len(cfg)} MCP server(s)...")
+                mcp = MCPManager(cfg)
+                mcp.start()
+                if mcp.connected_count():
+                    st_ok(f"[+] MCP: {mcp.connected_count()} server(s), "
+                       f"{mcp.tool_count()} tool(s)")
+                else:
+                    st_warn("[!] MCP: no servers connected")
+            else:
+                st_note("[*] no MCP servers configured (~/.mcp.json)")
+        except Exception as e:
+            st_warn(f"[!] MCP unavailable ({e})")
+            mcp = None
+    state["mcp"] = mcp
+
     pretty = not no_pretty
-    md = MDPrinter(pretty)
-    print("[*] Type /help for commands\n")
+    md = MDPrinter(pretty,
+                   header=(f"\n{ANSI['dim']}── GLM ──{ANSI['reset']}" if pretty else None))
+    tools_on = state.get("tools_on", False)
+    mcp_str = f"{mcp.connected_count()} server(s), {mcp.tool_count()} tool(s)" if mcp else "disabled"
+    st_ok(f"[+] model: {state['model']}   tools: {'ON' if tools_on else 'off'}   "
+       f"MCP: {mcp_str}   pretty: {'ON' if pretty else 'off'}")
+    st_note("[*] Type /help for commands")
+    print()
 
     try:
         import readline
@@ -451,7 +448,8 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
 
     while True:
         try:
-            inp = input("  You> ").strip()
+            you = _color(pretty, "cyan", "You")
+            inp = input(f"  {you} > ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -516,6 +514,98 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
                 else:
                     print(f"  Web search: {'ON' if state['web_search'] else 'off'}"
                           f"  Usage: /search on|off")
+            elif cmd == "/tools":
+                if arg.lower() in ("on", "1", "true"):
+                    state["tools_on"] = True
+                    print("  [+] Tools ON (local + MCP)")
+                elif arg.lower() in ("off", "0", "false"):
+                    state["tools_on"] = False
+                    print("  [+] Tools OFF")
+                else:
+                    print(f"  tools: {'ON' if state['tools_on'] else 'off'}")
+                    print(f"  local tools: {len(LOCAL_TOOL_NAMES)} "
+                          f"({', '.join(LOCAL_TOOL_NAMES)})")
+                    print(f"  MCP tools: {state['mcp'].tool_count() if state['mcp'] else 0}")
+                    print("  Usage: /tools on|off|list")
+            elif cmd == "/allow":
+                if not arg:
+                    al = load_allowlist()
+                    print("  allowlist paths:")
+                    for p in al["paths"]:
+                        print(f"    {p}")
+                    print("  allowlist domains:")
+                    for d in al["domains"]:
+                        print(f"    {d}")
+                    print("  allowlist servers:")
+                    for s in al.get("servers", []):
+                        print(f"    {s}")
+                    print("  Usage: /allow <path> | <url>")
+                else:
+                    from urllib.parse import urlparse
+                    u = urlparse(arg)
+                    if u.scheme in ("http", "https") and u.hostname:
+                        al = load_allowlist()
+                        if u.hostname not in al["domains"]:
+                            al["domains"].append(u.hostname)
+                            save_allowlist(al)
+                        print(f"  [+] allowlisted domain: {u.hostname}")
+                    else:
+                        p = os.path.abspath(os.path.expanduser(arg))
+                        al = load_allowlist()
+                        if p not in al["paths"]:
+                            al["paths"].append(p)
+                            save_allowlist(al)
+                        print(f"  [+] allowlisted path: {p}")
+            elif cmd == "/mcp":
+                if arg in ("", "status", "list"):
+                    if state["mcp"] is None:
+                        print("  (MCP disabled at startup)")
+                    else:
+                        for ln in state["mcp"].status_lines():
+                            print(ln)
+                        print(f"  registry: {state['mcp'].tool_count()} tool(s)")
+                elif arg in ("connect", "reload"):
+                    if state["mcp"] is None:
+                        print("  [!] MCP was disabled at startup (--no-mcp)")
+                    else:
+                        print("  [*] (re)connecting MCP servers...")
+                        state["mcp"].stop()
+                        state["mcp"].start()
+                        print(f"  [+] {state['mcp'].connected_count()} server(s), "
+                              f"{state['mcp'].tool_count()} tool(s)")
+                elif arg == "disconnect":
+                    if state["mcp"] is not None:
+                        state["mcp"].stop()
+                        print("  [+] MCP disconnected")
+                elif arg.startswith("allow "):
+                    name = arg.split(None, 1)[1].strip()
+                    if state["mcp"] is not None and name in state["mcp"].config:
+                        al = load_allowlist()
+                        al.setdefault("servers", [])
+                        if name not in al["servers"]:
+                            al["servers"].append(name)
+                            save_allowlist(al)
+                        print(f"  [+] MCP server allowlisted: {name}")
+                    else:
+                        print(f"  [!] unknown MCP server: {name}")
+                elif arg.startswith("deny "):
+                    name = arg.split(None, 1)[1].strip()
+                    al = load_allowlist()
+                    if name in al.get("servers", []):
+                        al["servers"].remove(name)
+                        save_allowlist(al)
+                        print(f"  [+] MCP server removed from allowlist: {name}")
+                    else:
+                        print(f"  {name}: not in allowlist")
+                elif arg == "tools":
+                    if state["mcp"] is not None:
+                        for t in state["mcp"].tool_names():
+                            print(f"    {t}")
+                    else:
+                        print("  (MCP disabled at startup)")
+                else:
+                    print("  Usage: /mcp status|connect|disconnect|reload|"
+                          "allow <name>|deny <name>|tools")
             elif cmd == "/temp":
                 try:
                     v = float(arg)
@@ -581,7 +671,15 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
             continue
 
         try:
-            ok, err = send_message(state, inp, md, debug_sse=debug_sse)
+            with working("waiting for GLM") as beacon:
+                if state["tools_on"]:
+                    ok, err = send_with_tools(state, inp, md=md, mcp=state.get("mcp"),
+                                              solver=state.get("solver"),
+                                              debug_sse=debug_sse,
+                                              on_token=beacon.stop)
+                else:
+                    ok, err = send_message(state, inp, md, debug_sse=debug_sse,
+                                           on_token=beacon.stop)
             if not ok:
                 print(f"\n[!] {err}", file=sys.stderr)
             else:
@@ -601,6 +699,12 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
     if solver:
         try:
             solver.close()
+        except Exception:
+            pass
+    mcp = state.get("mcp")
+    if mcp:
+        try:
+            mcp.stop()
         except Exception:
             pass
     try:

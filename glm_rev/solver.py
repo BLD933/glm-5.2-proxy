@@ -26,6 +26,7 @@ PATCH_JS = r"""
   if (window.__fetch_patched) return 'already';
   window.__fetch_patched = true;
   window.__last_captcha_token = null;
+  window.AliyunCaptchaConfig = { region: 'sgp', prefix: 'no8xfe' };
   const originalFetch = window.fetch;
   window.fetch = async function(...args) {
     const url = args[0];
@@ -43,6 +44,65 @@ PATCH_JS = r"""
   };
   return 'ok';
 })()
+"""
+
+WARM_JS = r"""
+async () => {
+  if (typeof window.z_um !== 'undefined' && typeof window.z_um.getToken === 'function') {
+    return true;
+  }
+  window.AliyunCaptchaConfig = { region: 'sgp', prefix: 'no8xfe' };
+  if (!window.initAliyunCaptcha) {
+    await new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[src*="AliyunCaptcha.js"]');
+      if (existing) {
+        existing.addEventListener('load', () => resolve());
+        existing.addEventListener('error', () => reject(new Error('script load failed')));
+        return;
+      }
+      const s = document.createElement('script');
+      s.src = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('script load failed'));
+      document.head.appendChild(s);
+    });
+  }
+  let el = document.getElementById('chat-captcha-element');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'chat-captcha-element';
+    el.style.cssText = 'position:absolute;left:-99999px;top:-99999px;width:0;height:0;overflow:hidden;pointer-events:none;';
+    document.body.appendChild(el);
+  }
+  let btn = document.getElementById('chat-captcha-trigger');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.id = 'chat-captcha-trigger';
+    btn.type = 'button';
+    btn.style.cssText = 'position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;opacity:0;';
+    document.body.appendChild(btn);
+  }
+  await new Promise((resolve) => {
+    window.initAliyunCaptcha({
+      SceneId: 'didk33e0',
+      mode: 'popup',
+      element: '#chat-captcha-element',
+      button: '#chat-captcha-trigger',
+      timeout: 10000,
+      getInstance: (instance) => {
+        window.__captcha_instance = instance;
+        resolve();
+      }
+    });
+  });
+  for (let i = 0; i < 50; i++) {
+    if (typeof window.z_um !== 'undefined' && typeof window.z_um.getToken === 'function') {
+      return true;
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}
 """
 
 CHROME = "/usr/bin/google-chrome"
@@ -200,9 +260,12 @@ async def _oneshot_impl(token: str, count: int) -> list[str]:
             await page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=40000)
             await _wait_for(page, "#chat-input", 20000)
             await page.evaluate(PATCH_JS)
-            await _drive_challenge(page, ctx, token, "hello test", None)
             has_zum = await page.evaluate(
                 "typeof window.z_um !== 'undefined' && !!window.z_um.getToken")
+            if not has_zum:
+                await _drive_challenge(page, ctx, token, "hello test", None)
+                has_zum = await page.evaluate(
+                    "typeof window.z_um !== 'undefined' && !!window.z_um.getToken")
             if not has_zum:
                 return []
             result = await page.evaluate(COLLECT_JS, count)
@@ -222,38 +285,14 @@ async def _wait_for(page, selector: str, timeout: float = 8000):
 
 
 async def _drive_challenge(page, ctx, token, probe_text, last_captcha):
-    """Click through to a fresh chat, send a probe, and wait for a new captcha token."""
-    await page.evaluate("""() => {
-      const b = [...document.querySelectorAll('button')];
-      const t = b.find(x => (x.innerText||'').trim() === 'Chat');
-      if (t) t.click();
-    }""")
-    await page.wait_for_timeout(1000)
-    await page.evaluate("""() => {
-      const b = [...document.querySelectorAll('button')];
-      const n = b.find(x => /^new chat$/i.test((x.innerText||'').trim()));
-      if (n) n.click();
-    }""")
-    await page.wait_for_timeout(1500)
-    await page.evaluate("""(probe) => {
-      const input = document.querySelector('#chat-input') || document.querySelector('textarea');
-      if (!input) return;
-      input.focus();
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-      setter.call(input, probe);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    }""", probe_text)
-    await page.wait_for_timeout(300)
-    await page.evaluate("""() => {
-      const btn = document.getElementById('send-message-button');
-      if (btn) btn.click();
-    }""")
-    for _ in range(200):
-        tk = await page.evaluate("window.__last_captcha_token || null")
-        if tk and tk != last_captcha:
+    """Directly initialize the Aliyun Captcha SDK so window.z_um is warm."""
+    try:
+        warmed = await page.evaluate(WARM_JS)
+        if warmed:
             cookies = await ctx.cookies()
-            return tk, _cookie_header(cookies)
-        await asyncio.sleep(0.1)
+            return "warmed", _cookie_header(cookies)
+    except Exception:
+        pass
     return None, None
 
 
@@ -319,6 +358,7 @@ class CaptchaSolver:
         except Exception as e:
             print(f"\x1b[33m[!] warm captcha solver failed: {e}\x1b[0m",
                   file=sys.stderr)
+            self._page = None
             return
         print("\x1b[2m[*] warm captcha solver ready\x1b[0m", file=sys.stderr)
         try:
@@ -356,7 +396,7 @@ class CaptchaSolver:
                 device_token = None
                 if time.time() >= ca._FAIL_BACKOFF_UNTIL:
                     device_token = ca.device_tokens.pop()
-                if not device_token:
+                if not device_token and self._page is not None:
                     tokens = self.collect_tokens(token, count=150)
                     if tokens:
                         ca.device_tokens.add_many(tokens)
@@ -425,6 +465,7 @@ class CaptchaSolver:
         await page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=40000)
         await _wait_for(page, "#chat-input", 20000)
         await page.evaluate(PATCH_JS)
+        await page.evaluate(WARM_JS)
         # Bulk-harvest device tokens so the in-memory pool can serve captcha
         # params without any further challenge round-trip. This warms the
         # Aliyun SDK (window.z_um) internally; the DOM token it produces is
@@ -434,12 +475,15 @@ class CaptchaSolver:
             harvested = await self._collect_coro(token, 150)
             if harvested:
                 ca.device_tokens.add_many(harvested)
+                print(f"[solver] _open harvested {len(harvested)} tokens, pool={len(ca.device_tokens)}", file=sys.stderr)
                 # The pool is warmed by register_solver AFTER _open returns
                 # (never start it here: its generator would run compute_final
                 # concurrently with the authoritative compute below, and
                 # concurrent verify bursts amplify the F001 device flag).
-        except Exception:
-            pass
+            else:
+                print("[solver] _open harvest returned 0 tokens", file=sys.stderr)
+        except Exception as e:
+            print(f"[solver] _open harvest raised {type(e).__name__}: {e}", file=sys.stderr)
         # Authoritative in-memory path: compute a fresh captcha from a
         # harvested device token instead of serving the DOM token.
         try:
@@ -448,8 +492,9 @@ class CaptchaSolver:
                 payload = ca.compute_final(device_token)
                 if payload:
                     return payload, None
-        except Exception:
-            pass
+                print("[!] _open: compute_final returned None (verify rejected)", file=sys.stderr)
+        except Exception as e:
+            print(f"[!] _open: compute_final raised {type(e).__name__}: {e}", file=sys.stderr)
         return None, None
 
     async def _collect_coro(self, token: str, count: int) -> list[str]:

@@ -26,6 +26,10 @@ def main():
     ap.add_argument("--list-models", action="store_true", help="List available models")
     ap.add_argument("--repl", action="store_true", help="Launch interactive REPL")
     ap.add_argument("--no-pretty", action="store_true", help="Disable ANSI markdown rendering in REPL")
+    ap.add_argument("--tools", action="store_true",
+                    help="Start the REPL with local + MCP tool execution enabled")
+    ap.add_argument("--no-mcp", action="store_true",
+                    help="Do not connect MCP servers at REPL startup")
     ap.add_argument("--debug-sse", action="store_true",
                     help="Print raw SSE events to stderr for every streamed turn")
     a = ap.parse_args()
@@ -36,7 +40,8 @@ def main():
 
     if a.repl:
         run_repl(TOKEN, start_model=a.model, no_pretty=a.no_pretty,
-                 start_think=a.thinking, debug_sse=a.debug_sse)
+                 start_think=a.thinking, debug_sse=a.debug_sse,
+                 tools=a.tools, no_mcp=a.no_mcp)
         return
 
     print("Stealing fresh captcha token & cookies via headless browser...")

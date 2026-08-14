@@ -19,8 +19,10 @@ import hmac
 import json
 import os
 import random
+import sys
 import threading
 import time
+import urllib.error
 import uuid
 import zlib
 from collections import deque
@@ -72,6 +74,11 @@ _FAIL_BACKOFF_UNTIL = 0.0
 # Default device-token collection hook (overridden by solver/server).
 _DEVICE_COLLECTOR = None
 _device_lock = threading.Lock()
+# Serialize every verify against the Aliyun side (compute_final = 1 verify;
+# ~2-3 rapid ones re-flag the device). The pool generator, the warm solver's
+# authoritative compute, and the one-shot fallback all funnel through here so
+# no two verifies can ever overlap.
+_verify_lock = threading.Lock()
 
 
 def set_device_collector(cb):
@@ -297,14 +304,14 @@ def verify_captcha(certify_id: str, data_value: str, device_token: str) -> str |
     params["Signature"] = aliyun_signature(params, SECRET_KEY)
     resp = _http_post(VERIFY_URL, build_query_string(params), {"Referer": ""})
     data = json.loads(resp)
-    if not data.get("Success"):
+    if not data.get("Success") or not (data.get("Result") or {}).get("VerifyResult"):
+        print(f"[verify_captcha] rejected: {resp[:400]}", file=sys.stderr)
         return None
     result = data.get("Result") or {}
-    if not result.get("VerifyResult"):
-        return None
     security_token = result.get("securityToken")
     result_certify = result.get("certifyId")
     if not security_token or not result_certify:
+        print(f"[verify_captcha] missing securityToken/certifyId: {resp[:400]}", file=sys.stderr)
         return None
     final = json.dumps({
         "certifyId": result_certify,
@@ -317,6 +324,14 @@ def verify_captcha(certify_id: str, data_value: str, device_token: str) -> str |
 
 def compute_final(device_token: str) -> str | None:
     """Full in-memory flow for one device token. Returns final payload or None."""
+    with _verify_lock:
+        payload = _compute_final_unlocked(device_token)
+        print(f"[compute_final] token {device_token[:24]}... -> "
+              f"{'PAYLOAD' if payload else 'None'}", file=sys.stderr)
+        return payload
+
+
+def _compute_final_unlocked(device_token: str) -> str | None:
     certify_id = init_captcha()
     arg_value = generate_arg(certify_id)
     ct = int(time.time() * 1000)
@@ -355,7 +370,7 @@ class DeviceTokenPool:
     """
 
     def __init__(self, path: Path | None = None):
-        self._path = path or Path(__file__).resolve().parent.parent / "zai" / "device_tokens.txt"
+        self._path = Path(path) if path else Path(__file__).resolve().parent.parent / "zai" / "device_tokens.txt"
         self._lock = threading.Lock()
         self._tokens: list[tuple[float, str]] = []  # (added_epoch, token)
         self._consumed = set()  # single-use tokens handed out; never resurrect
@@ -388,13 +403,18 @@ class DeviceTokenPool:
     def pop(self) -> str | None:
         with self._lock:
             now = time.time()
+            # Prefer the NEWEST in-TTL token. add_many() appends, so the tail is
+            # the freshest batch (e.g. the 150 tokens _open just harvested);
+            # FIFO pop(0) served stale file leftovers / pool-generator tokens
+            # first, so compute_final verified an old or already-consumed token.
             while self._tokens:
-                added, tok = self._tokens.pop(0)
+                added, tok = self._tokens.pop()
                 if now - added < _DEVICE_TOKEN_TTL_S:
                     self._consumed.add(tok)
                     self._consumed_order.append(tok)
                     if len(self._consumed_order) > _CONSUMED_CAP:
                         self._consumed.discard(self._consumed_order.popleft())
+                    self._persist()
                     return tok
             return None
 
@@ -525,11 +545,19 @@ class CaptchaPool:
         # backoff immediately so a flagged device is never hammered with
         # concurrent verify bursts (each compute_final = 1 verify; ~2-3 rapid
         # ones re-flag the device). Never reharvest the browser here.
+        #
+        # Network-layer failures (DNS/TLS/connect timeout) are transient: the
+        # device was never touched, so do NOT arm the backoff. But an
+        # HTTPError means the verify request LANDED (server responded) — the
+        # device WAS touched, so arm the backoff to stop the next attempt from
+        # re-arming the F001 flag (each compute_final = 1 verify).
         with _device_lock:
             until = _FAIL_BACKOFF_UNTIL
         if time.time() < until:
             time.sleep(until - time.time())
-        for _ in range(3):
+        for attempt in range(3):
+            if attempt:
+                time.sleep(2.0)            # space verifies; no sub-second bursts
             token = device_tokens.pop()
             if token is None:
                 collected = _collect_device_tokens()
@@ -540,8 +568,13 @@ class CaptchaPool:
                     return None
             try:
                 payload = compute_final(token)
-            except Exception:
+            except urllib.error.HTTPError:
+                # Request landed (server responded): device WAS touched.
+                with _device_lock:
+                    _FAIL_BACKOFF_UNTIL = time.time() + _FAIL_BACKOFF_S
                 continue
+            except (urllib.error.URLError, TimeoutError, OSError):
+                continue                   # transient network, device untouched
             if payload:
                 return payload
             with _device_lock:
@@ -589,6 +622,14 @@ def solve(timeout: float = _SOLVE_TIMEOUT) -> str | None:
     slow browser challenge path. Poll the pool briefly before giving up.
     """
     if not enabled():
+        return None
+    if not captcha_pool._started:
+        # Pool not started yet = no solver registered. register_solver() is
+        # what starts it, AFTER the warm solver's authoritative compute has
+        # already returned (solver.py). Starting the generator here instead
+        # lets it verify freshly harvested tokens CONCURRENTLY with that
+        # authoritative compute and re-arm the F001 device flag. Caller falls
+        # through to the warm solver path, which then registers the solver.
         return None
     ensure_started()
     deadline = time.time() + timeout

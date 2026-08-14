@@ -1,11 +1,149 @@
 """High-level client operations: session creation, token refresh, and chat streaming."""
 import json
+import re
+import sys
 import time
 import uuid
 import requests
 
 from .config import BASE, ENDPOINT
 from .api import headers, sign, user_id_from_token
+
+_HTTP = requests.Session()
+
+_DETAILS_RE = re.compile(r'<details type="reasoning"[^>]*>(.*?)</details>', re.S)
+
+
+def split_reasoning(text):
+    """Return (reasoning_or_None, answer_without_reasoning)."""
+    m = _DETAILS_RE.search(text)
+    if not m:
+        return None, text
+    reasoning = m.group(1).strip()
+    answer = (text[:m.start()] + text[m.end():]).strip()
+    return reasoning, answer
+
+
+def stream_turn(*, token, cookie, sig, url, chat_id, model, messages,
+                current_user_message_id, current_user_message_parent_id,
+                is_first, features, params, captcha, debug_sse=False,
+                on_thinking=None, on_answer=None):
+    """Send one chat.completions turn and capture the full streamed output.
+
+    Returns a dict with keys: full, reasoning, answer, id, parent, usage,
+    stream_error, stream_status, captcha_error — or {"error": str} on
+    transport/HTTP failure. Does not print anything (except optional SSE debug).
+    `signature_prompt` is derived from the last message so callers must build
+    the signature with sign(last_message_content, ...)."""
+    body = {
+        "chat_id": chat_id,
+        "current_user_message_id": current_user_message_id,
+        "current_user_message_parent_id": current_user_message_parent_id,
+        "extra": {},
+        "features": features,
+        "id": str(uuid.uuid4()),
+        "messages": messages,
+        "model": model,
+        "params": params,
+        "signature_prompt": messages[-1]["content"] if messages else "",
+        "stream": True,
+        "variables": {},
+        "captcha_verify_param": captcha,
+    }
+    if is_first:
+        body["background_tasks"] = {"title_generation": True, "tags_generation": True}
+    try:
+        resp = _HTTP.post(url, headers=headers(token, sig, cookie), json=body,
+                             stream=True, timeout=60)
+    except requests.exceptions.RequestException as e:
+        return {"error": f"upstream error: {e}"}
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text[:500]}"}
+
+    buf = []
+    new_id = None
+    new_parent = None
+    usage = None
+    stream_error = None
+    captcha_error = None
+    stream_status = None
+    thinking_len = 0
+    deadline = time.time() + 120
+
+    try:
+        for line in resp.iter_lines(decode_unicode=True):
+            if time.time() > deadline:
+                stream_error = stream_error or {"code": "STREAM_TIMEOUT",
+                                                "detail": "stream exceeded 120s"}
+                break
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            if debug_sse:
+                print(f"\x1b[2m[sse] {data}\x1b[0m", file=sys.stderr)
+            try:
+                j = json.loads(data)
+            except Exception:
+                continue
+            inner = j.get("data")
+            if not isinstance(inner, dict):
+                continue
+            phase = inner.get("phase")
+            delta = inner.get("delta_content")
+            edit_index = inner.get("edit_index")
+            edit_content = inner.get("edit_content")
+            if inner.get("id"):
+                new_id = inner["id"]
+            if inner.get("parent_message_id"):
+                new_parent = inner["parent_message_id"]
+            if inner.get("usage"):
+                usage = inner["usage"]
+            if inner.get("error"):
+                e = inner["error"]
+                code = e.get("code") if isinstance(e, dict) else None
+                if code == "FRONTEND_CAPTCHA_REQUIRED":
+                    captcha_error = e
+                elif stream_error is None:
+                    stream_error = e
+            if inner.get("status"):
+                stream_status = inner["status"]
+            if delta:
+                buf.append(delta)
+                if phase == "thinking":
+                    thinking_len += len(delta)
+                    if on_thinking is not None:
+                        on_thinking(delta)
+                elif on_answer is not None:
+                    on_answer(delta)
+            elif edit_index is not None and edit_content is not None:
+                idx = int(edit_index)
+                cur = "".join(buf)
+                buf = [cur[:idx] + edit_content]
+                if idx < thinking_len:
+                    thinking_len = idx
+    except requests.exceptions.RequestException as e:
+        stream_error = stream_error or {"code": "STREAM_READ_ERROR", "detail": str(e)}
+    except Exception as e:
+        stream_error = stream_error or {"code": "STREAM_READ_ERROR", "detail": f"{type(e).__name__}: {e}"}
+
+    full = "".join(buf)
+    reasoning, text = split_reasoning(full)
+    if reasoning is None and thinking_len:
+        reasoning = full[:thinking_len].strip() or None
+        text = full[thinking_len:]
+    return {
+        "full": full,
+        "reasoning": reasoning,
+        "answer": text,
+        "id": new_id,
+        "parent": new_parent,
+        "usage": usage,
+        "stream_error": stream_error,
+        "stream_status": stream_status,
+        "captcha_error": captcha_error,
+    }
 
 # Features payload verified live against chat.z.ai (glm-5.2) on 2026-08-13:
 # enable_thinking=True  -> {"enable_thinking": true, "reasoning_effort": "high"|"max"}
@@ -31,7 +169,7 @@ def build_features(enable_thinking: bool, reasoning_effort: str, web_search: boo
 
 
 def refresh_token(token: str) -> str:
-    r = requests.get(f"{BASE}/api/v1/auths/", headers=headers(token), timeout=20)
+    r = _HTTP.get(f"{BASE}/api/v1/auths/", headers=headers(token), timeout=20)
     if r.status_code != 200:
         return token
     j = r.json()
@@ -79,7 +217,7 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             "type": "default",
         }
     }
-    r = requests.post(f"{BASE}/api/v1/chats/new", json=chat_body,
+    r = _HTTP.post(f"{BASE}/api/v1/chats/new", json=chat_body,
                       headers=headers(token, cookie=cookie), timeout=20)
     if r.status_code == 200:
         try:
@@ -122,7 +260,7 @@ def chat(prompt: str, token: str, model: str = "glm-5.2", chat_id: str = None,
     }
     if captcha:
         body["captcha_verify_param"] = captcha
-    r = requests.post(url, headers=headers(token, sig, cookie), json=body,
+    r = _HTTP.post(url, headers=headers(token, sig, cookie), json=body,
                       stream=True, timeout=120)
     print("HTTP", r.status_code)
     print("CT", r.headers.get("content-type"))
@@ -163,7 +301,7 @@ def chat(prompt: str, token: str, model: str = "glm-5.2", chat_id: str = None,
 
 
 def list_models(token: str) -> None:
-    r = requests.get(f"{BASE}/api/models", headers=headers(token, "x"), timeout=30)
+    r = _HTTP.get(f"{BASE}/api/models", headers=headers(token, "x"), timeout=30)
     print("HTTP", r.status_code)
     if r.status_code == 200:
         for m in r.json().get("data", []):

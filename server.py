@@ -1,6 +1,7 @@
 """GLM web server: OpenAI-compatible API + multi-turn chat endpoint + web UI."""
 import asyncio
 import json
+from contextlib import asynccontextmanager
 import os
 import threading
 import time
@@ -22,7 +23,22 @@ from glm_rev import captcha_aliyun as ca
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-app = FastAPI(title="GLM Proxy + UI")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        raw_token = get_token()
+        token = refresh_token(raw_token)
+        register_solver(None, token)
+        solver = _get_warm_solver()
+        solver.start_background(token)
+        print("[*] server lifespan: warm captcha solver started in background")
+    except Exception as e:
+        print(f"[!] server lifespan solver warmup failed: {e}")
+    yield
+
+
+app = FastAPI(title="GLM Proxy + UI", lifespan=lifespan)
 
 # Aliyun captcha tokens are SINGLE-USE — never cache or reuse them.
 # A warm Playwright solver (daemon thread) issues a fresh token per request.
@@ -143,8 +159,9 @@ def _sync_captcha(token: str):
                 captcha, cookie = solver.start(token)
             else:
                 captcha, cookie = solver.solve(token)
-            if captcha:
+            if solver._thread and solver._thread.is_alive():
                 register_solver(solver, token)
+            if captcha:
                 return captcha, cookie
         except Exception as e:
             print(f"[!] Warm captcha solver unavailable: {e}")
