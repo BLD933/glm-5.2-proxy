@@ -9,6 +9,7 @@ import uuid
 import uvicorn
 import requests
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Union
@@ -39,6 +40,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GLM Proxy + UI", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Aliyun captcha tokens are SINGLE-USE — never cache or reuse them.
 # A warm Playwright solver (daemon thread) issues a fresh token per request.
@@ -61,6 +69,49 @@ def get_token() -> str:
         return open(os.path.join(HERE, "zai", "token.txt")).read().strip()
     except Exception:
         raise HTTPException(status_code=500, detail="ZAI token not found in zai/token.txt")
+
+
+MODEL_ALIASES = {
+    "gpt-4o": "glm-5.2", "gpt-4": "glm-5.2", "gpt-4-turbo": "glm-5.2",
+    "claude-3-5-sonnet": "glm-5.2", "claude-sonnet-4": "glm-5.2",
+    "deepseek-chat": "glm-5.2", "deepseek-reasoner": "glm-5.2",
+    "default": "glm-5.2",
+}
+
+
+def _alias_models():
+    return [{
+        "id": a, "object": "model", "owned_by": "z.ai", "created": 0,
+        "name": f"alias -> {t}",
+    } for a, t in MODEL_ALIASES.items()]
+
+
+def chunk_init(completion_id: str, created: int, model: str) -> dict:
+    """First SSE chunk: declare assistant role before any content."""
+    return {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": ""},
+            "finish_reason": None,
+        }],
+    }
+
+
+def normalize_usage(u) -> Optional[dict]:
+    """Map upstream usage (any shape) to OpenAI prompt/completion/total tokens."""
+    if not isinstance(u, dict):
+        return None
+    p = u.get("prompt_tokens") or u.get("prompts") or u.get("in") or u.get("input_tokens")
+    c = u.get("completion_tokens") or u.get("out") or u.get("output_tokens")
+    if p is None and c is None:
+        return None
+    p = int(p or 0)
+    c = int(c or 0)
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
 def model_catalog():
@@ -92,7 +143,7 @@ def model_catalog():
                 "name": m.get("name", mid),
             })
         if out:
-            return out
+            return out + _alias_models()
     except Exception:
         pass
     fallback = [
@@ -101,12 +152,16 @@ def model_catalog():
         "GLM-4.1V-Thinking-FlashX", "deep-research", "zero",
         "glm-4-flash", "0808-360B-DR", "glm-4-air-250414",
     ]
-    return [{"id": m, "object": "model", "owned_by": "z.ai", "created": 0, "name": m} for m in fallback]
+    return [{"id": m, "object": "model", "owned_by": "z.ai", "created": 0, "name": m} for m in fallback] + _alias_models()
 
 
 class Message(BaseModel):
     role: str
-    content: Union[str, List[dict]]
+    content: Optional[Union[str, List[dict]]] = ""
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[dict]] = None
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -120,6 +175,7 @@ class ChatCompletionRequest(BaseModel):
     web_search: Optional[bool] = False
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
+    stream_options: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):
@@ -248,7 +304,7 @@ def _tool_state(req: ChatCompletionRequest, token: str) -> dict:
     return {
         "token": token,
         "cookie": None,
-        "model": req.model or "glm-5.2",
+        "model": MODEL_ALIASES.get(req.model or "glm-5.2", req.model or "glm-5.2"),
         "enable_thinking": req.enable_thinking,
         "reasoning_effort": req.reasoning_effort or "max",
         "web_search": req.web_search,
@@ -295,7 +351,7 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
     captcha_fn = lambda: _captcha_pair(token)
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
-    model = req.model or "glm-5.2"
+    model = MODEL_ALIASES.get(req.model or "glm-5.2", req.model or "glm-5.2")
 
     def chunk(delta, finish_reason=None):
         return {
@@ -336,7 +392,11 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
                 errmsg = f"\n[error] {done['err']}"
                 for i in range(0, len(errmsg), 48):
                     yield f"data: {json.dumps(chunk(errmsg[i:i + 48]))}\n\n"
-            yield f"data: {json.dumps(chunk(None, finish_reason='stop'))}\n\n"
+            finish = chunk(None, finish_reason='stop')
+            norm = normalize_usage(state["usage"])
+            if norm:
+                finish["usage"] = norm
+            yield f"data: {json.dumps(finish)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -394,6 +454,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         chat_model = req.model
         if not chat_model:
             chat_model = "glm-5.2"
+        chat_model = MODEL_ALIASES.get(chat_model, chat_model)
 
         chat_id, msg_id = create_chat(token, prompt, model=chat_model, cookie=cookie,
                                       enable_thinking=req.enable_thinking,
@@ -428,6 +489,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
         def collect():
             full_text = ""
+            reasoning = ""
+            usage = None
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data:"):
                     continue
@@ -436,39 +499,62 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     break
                 try:
                     j = json.loads(data)
-                    delta = j.get("data", {}).get("delta_content") or ""
-                    full_text += delta
+                    inner = j.get("data", {})
+                    phase = inner.get("phase")
+                    delta = inner.get("delta_content") or ""
+                    if inner.get("usage"):
+                        usage = inner.get("usage")
+                    if phase == "thinking":
+                        reasoning += delta
+                    else:
+                        full_text += delta
                 except Exception:
                     pass
-            return full_text
+            return full_text, reasoning, usage
 
         if not req.stream:
-            full_text = collect()
+            full_text, reasoning, usage = collect()
+            message = {"role": "assistant", "content": full_text or None}
+            if reasoning:
+                message["reasoning_content"] = reasoning
             return {
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": req.model,
+                "model": chat_model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": full_text},
+                    "message": message,
                     "finish_reason": "stop",
                 }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                "usage": normalize_usage(usage) or {
+                    "prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20,
+                },
             }
 
         async def event_generator():
+            yield f"data: {json.dumps(chunk_init(completion_id, int(time.time()), chat_model))}\n\n"
+            usage = None
             for line in resp.iter_lines(decode_unicode=True):
                 if not line:
                     continue
                 if line.startswith("data:"):
                     data = line[5:].strip()
                     if data == "[DONE]":
-                        yield "data: [DONE]\n\n"
                         break
                     try:
                         j = json.loads(data)
-                        delta = j.get("data", {}).get("delta_content") or ""
+                        inner = j.get("data", {})
+                        phase = inner.get("phase")
+                        delta = inner.get("delta_content") or ""
+                        if inner.get("usage"):
+                            usage = inner.get("usage")
+                        if not delta:
+                            continue
+                        if phase == "thinking":
+                            delta_key = "reasoning_content"
+                        else:
+                            delta_key = "content"
                         chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -476,13 +562,28 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "model": chat_model,
                             "choices": [{
                                 "index": 0,
-                                "delta": {"content": delta} if delta else {},
+                                "delta": {delta_key: delta},
                                 "finish_reason": None,
                             }],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
                     except Exception:
                         pass
+            finish = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": chat_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }
+            norm = normalize_usage(usage)
+            if norm:
+                finish["usage"] = norm
+            yield f"data: {json.dumps(finish)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -514,7 +615,7 @@ async def api_chat(req: ChatRequest, request: Request):
         captcha, cookie = await acquire_captcha(token)
 
         prompt = req.prompt.strip()
-        chat_model = req.model or "glm-5.2"
+        chat_model = MODEL_ALIASES.get(req.model or "glm-5.2", req.model or "glm-5.2")
         temperature = req.temperature if req.temperature is not None else 1.0
         max_tokens = req.max_tokens if req.max_tokens is not None else 8192
 
