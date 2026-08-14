@@ -2,7 +2,7 @@
 import asyncio
 import json
 import os
-import re
+import threading
 import time
 import uuid
 import uvicorn
@@ -12,10 +12,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Union
 
-from glm_rev.solver import steal_captcha, CaptchaSolver
+from glm_rev.solver import steal_captcha, CaptchaSolver, register_solver
 from glm_rev.client import create_chat, refresh_token, build_features
 from glm_rev.config import BASE, ENDPOINT
 from glm_rev.api import sign, headers, user_id_from_token
+from glm_rev.tools import send_with_tools
+from glm_rev.mcp import MCPManager, load_mcp_config
+from glm_rev import captcha_aliyun as ca
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,8 +26,14 @@ app = FastAPI(title="GLM Proxy + UI")
 
 # Aliyun captcha tokens are SINGLE-USE — never cache or reuse them.
 # A warm Playwright solver (daemon thread) issues a fresh token per request.
+# Captcha solves are serialized on a threading.Lock because the warm solver is
+# a single shared browser (used by both async endpoint code and tool threads).
 _warm_solver = None
-_captcha_lock = None
+_solver_lock = threading.Lock()
+
+# MCP servers are connected lazily on the first tools request.
+_mcp = None
+_mcp_lock = threading.Lock()
 
 # Multi-turn sessions for /api/chat
 SESSIONS = {}
@@ -115,41 +124,228 @@ def _get_warm_solver() -> CaptchaSolver:
     return _warm_solver
 
 
-async def acquire_captcha(token: str):
-    """Return a fresh (captcha, cookie) pair. Single-use tokens: never reused.
+def _sync_captcha(token: str):
+    """Synchronously acquire a fresh (captcha, cookie) pair. Thread-safe.
 
-    Tries the warm Playwright solver first (no browser relaunch per request);
-    falls back to up to 3 one-shot headless solves. Requests are serialized on
-    a lock because the warm solver is a single shared browser."""
-    global _captcha_lock
-    if _captcha_lock is None:
-        _captcha_lock = asyncio.Lock()
-    async with _captcha_lock:
-        solver = await asyncio.to_thread(_get_warm_solver)
+    Tries the in-memory Aliyun captcha pool first (no browser at all), then
+    the warm Playwright solver (no browser relaunch per request); falls back
+    to up to 3 one-shot headless solves. Serialized on a threading.Lock so
+    the shared warm solver browser is never used concurrently. Raises
+    RuntimeError if all attempts fail."""
+    if ca.enabled():
+        param = ca.solve()
+        if param:
+            return param, None
+    with _solver_lock:
+        solver = _get_warm_solver()
         try:
             if not solver._thread or not solver._thread.is_alive():
-                captcha, cookie = await asyncio.to_thread(solver.start, token)
+                captcha, cookie = solver.start(token)
             else:
-                captcha, cookie = await asyncio.to_thread(solver.solve, token)
+                captcha, cookie = solver.solve(token)
             if captcha:
+                register_solver(solver, token)
                 return captcha, cookie
         except Exception as e:
             print(f"[!] Warm captcha solver unavailable: {e}")
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                captcha, cookie = await steal_captcha(token)
+                captcha, cookie = asyncio.run(steal_captcha(token))
                 if captcha:
                     return captcha, cookie
             except Exception as e:
                 print(f"[!] One-shot captcha solver attempt {attempt + 1} failed: {e}")
-            await asyncio.sleep(1)
-    raise HTTPException(status_code=502,
-                        detail="Failed to acquire Aliyun captcha verification token after multiple attempts")
+            time.sleep(1)
+    raise RuntimeError("Failed to acquire Aliyun captcha verification token after multiple attempts")
+
+
+async def acquire_captcha(token: str):
+    """Async wrapper around _sync_captcha; keeps the event loop unblocked."""
+    try:
+        return await asyncio.to_thread(_sync_captcha, token)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _captcha_pair(token: str):
+    """Tool-loop captcha_fn: returns (captcha, cookie) or None (no raise)."""
+    try:
+        return _sync_captcha(token)
+    except Exception as e:
+        print(f"[!] captcha acquisition failed: {e}")
+        return None
+
+
+def _get_mcp() -> Optional[MCPManager]:
+    """Lazily connect configured MCP servers (thread-safe, once)."""
+    global _mcp
+    with _mcp_lock:
+        if _mcp is None:
+            try:
+                cfg = load_mcp_config()
+                if cfg:
+                    m = MCPManager(cfg)
+                    m.start()
+                    if m.connected_count():
+                        print(f"[*] MCP: {m.connected_count()} server(s), "
+                              f"{m.tool_count()} tool(s)")
+                    else:
+                        print("[!] MCP: no servers connected")
+                    _mcp = m
+                else:
+                    print("[*] no MCP servers configured (~/.mcp.json)")
+            except Exception as e:
+                print(f"[!] MCP unavailable ({e})")
+                _mcp = None
+    return _mcp
+
+
+class _QueueWriter:
+    """Pushes text from a tool-loop thread onto an asyncio.Queue as chunks."""
+
+    def __init__(self, loop, queue):
+        self._loop = loop
+        self._q = queue
+
+    def write(self, text):
+        for i in range(0, len(text), 48):
+            chunk = text[i:i + 48]
+            self._loop.call_soon_threadsafe(self._q.put_nowait, chunk)
+
+
+class _CaptureWriter:
+    """Collects tool-loop final output (non-streaming requests)."""
+
+    def __init__(self):
+        self.parts = []
+
+    def write(self, text):
+        self.parts.append(text)
+
+    @property
+    def text(self):
+        return "".join(self.parts)
+
+
+def _tool_state(req: ChatCompletionRequest, token: str) -> dict:
+    return {
+        "token": token,
+        "cookie": None,
+        "model": req.model or "glm-5.2",
+        "enable_thinking": req.enable_thinking,
+        "reasoning_effort": req.reasoning_effort or "max",
+        "web_search": req.web_search,
+        "temperature": req.temperature if req.temperature is not None else 1.0,
+        "max_tokens": req.max_tokens if req.max_tokens is not None else 8192,
+        "chat_id": None,
+        "last_assistant_id": None,
+        "last_assistant_parent_id": None,
+        "history": [],
+        "usage": {"prompts": 0, "in": 0, "out": 0},
+        "solver": None,
+    }
 
 
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": model_catalog()}
+
+
+def _tool_prompt(req: ChatCompletionRequest) -> str:
+    prompt = ""
+    for m in req.messages:
+        if m.role != "user":
+            continue
+        content = m.content
+        if isinstance(content, list):
+            content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+        prompt = content
+    return prompt
+
+
+async def _run_with_tools(req: ChatCompletionRequest, token: str):
+    """Execute the real tool loop (local + MCP) for an OpenAI tools request.
+
+    Runs send_with_tools on a worker thread (it blocks on captcha solves and
+    upstream SSE). Each tool-loop iteration grabs a FRESH single-use captcha via
+    _captcha_pair, serialized on the shared solver lock. Local write/run tools
+    are gated by GLM_TOOL_AUTORUN policy (approve_tool_auto)."""
+    prompt = _tool_prompt(req)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="No user message")
+    state = _tool_state(req, token)
+    mcp = _get_mcp()
+    captcha_fn = lambda: _captcha_pair(token)
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(time.time())
+    model = req.model or "glm-5.2"
+
+    def chunk(delta, finish_reason=None):
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": delta} if delta else {},
+                "finish_reason": finish_reason,
+            }],
+        }
+
+    if req.stream:
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        writer = _QueueWriter(loop, queue)
+        done = {"ok": True, "err": None}
+
+        def run():
+            try:
+                done["ok"], done["err"] = send_with_tools(
+                    state, prompt, mcp=mcp, auto_approve=True, writer=writer,
+                    captcha_fn=captcha_fn)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        loop.run_in_executor(None, run)
+
+        async def event_generator():
+            while True:
+                piece = await queue.get()
+                if piece is None:
+                    break
+                yield f"data: {json.dumps(chunk(piece))}\n\n"
+            if not done["ok"] and done["err"]:
+                errmsg = f"\n[error] {done['err']}"
+                for i in range(0, len(errmsg), 48):
+                    yield f"data: {json.dumps(chunk(errmsg[i:i + 48]))}\n\n"
+            yield f"data: {json.dumps(chunk(None, finish_reason='stop'))}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    writer = _CaptureWriter()
+    ok, err = await asyncio.to_thread(
+        send_with_tools, state, prompt, mcp=mcp, auto_approve=True,
+        writer=writer, captcha_fn=captcha_fn)
+    if not ok and not writer.text:
+        raise HTTPException(status_code=502, detail=err or "tool loop failed")
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": writer.text or None},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": state["usage"]["in"],
+            "completion_tokens": state["usage"]["out"],
+            "total_tokens": state["usage"]["in"] + state["usage"]["out"],
+        },
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -158,22 +354,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         token = get_token()
         token = refresh_token(token)
 
-        tool_contract_prefix = ""
         if req.tools:
-            tool_contract_prefix = (
-                "CRITICAL SYSTEM INSTRUCTION:\n"
-                "You have access to tools. When you want or need to invoke a tool, you MUST reply with "
-                "EXACTLY ONE line in this precise format and nothing else on that line:\n"
-                "TOOL:tool_name({\"param\": \"value\"})\n\n"
-                "Available tools:\n"
-            )
-            for t in req.tools:
-                fn = t.get("function", {})
-                name = fn.get("name")
-                desc = fn.get("description", "")
-                params = json.dumps(fn.get("parameters", {}))
-                tool_contract_prefix += f"- TOOL:{name}({params}) : {desc}\n"
-            tool_contract_prefix += "\nAlways use TOOL: format when tool assistance is required.\n\n"
+            return await _run_with_tools(req, token)
 
         formatted_messages = []
         prompt = ""
@@ -189,9 +371,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 formatted_messages.append({"role": "assistant", "content": content})
             elif role == "tool":
                 formatted_messages.append({"role": "user", "content": f"[Tool Result]: {content}"})
-        if tool_contract_prefix:
-            prompt = tool_contract_prefix + prompt
-            formatted_messages[-1]["content"] = prompt
 
         captcha, cookie = await acquire_captcha(token)
 
@@ -248,35 +427,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
         if not req.stream:
             full_text = collect()
-            tool_match = re.search(r"TOOL:\s*([A-Za-z0-9_-]+)\s*\((.*?)\)", full_text, re.DOTALL)
-            if tool_match and req.tools:
-                t_name = tool_match.group(1)
-                t_raw_args = tool_match.group(2).strip()
-                try:
-                    t_args = json.loads(t_raw_args)
-                except Exception:
-                    t_args = {}
-                clean_content = full_text.replace(tool_match.group(0), "").strip()
-                return {
-                    "id": completion_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": req.model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": clean_content if clean_content else None,
-                            "tool_calls": [{
-                                "id": f"call_{uuid.uuid4().hex[:8]}",
-                                "type": "function",
-                                "function": {"name": t_name, "arguments": json.dumps(t_args)},
-                            }],
-                        },
-                        "finish_reason": "tool_calls",
-                    }],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
-                }
             return {
                 "id": completion_id,
                 "object": "chat.completion",
