@@ -70,17 +70,26 @@ TOOL_CONTRACT = (
 )
 
 TOOL_HINT = (
-    "\n(Reminder: you may emit TOOL: lines across iterations for multi-step tasks. "
-    "Do NOT repeat calls with identical arguments; when you have all needed information, "
-    "write your final answer.)"
+    "\n(Reminder: emit TOOL: lines across iterations for multi-step tasks; never "
+    "repeat identical calls. Available tools — one per line, nothing else:\n"
+    "  TOOL:read_file({\"path\": ...})\n"
+    "  TOOL:list_dir({\"path\": ...})\n"
+    "  TOOL:write_file({\"path\": ..., \"content\": ...})\n"
+    "  TOOL:edit_lines({\"path\": ..., \"start\": N, \"delete\": M, \"content\": ...})\n"
+    "  TOOL:run_command({\"cmd\": ...})\n"
+    "  TOOL:web_fetch({\"url\": ...})\n"
+    "When all info gathered, write your final answer.)"
 )
 
 REFUSAL_RE = re.compile(
-    r"can'?t (access|reach|read)|cannot (access|reach|read)|upload (them|it|files)|"
-    r"paste (the |its )?content|not your (machine|pc|computer)|"
+    r"can[’']?t (access|reach|read|open)|cannot (access|reach|read|open)|"
+    r"unable to (view|access|read|open|see)|"
+    r"don[’']t have (permission|access|authorization|ability)|"
+    r"no (permission|authorization)|denied permission|access denied|"
+    r"upload (them|it|files)|paste (the |its )?content|not your (machine|pc|computer)|"
     r"only (work|run|reach) (within|inside|in) (my|their|a) (sandbox|container)|"
-    r"no (direct )?path (to|between)|there's no (way|tunnel)|"
-    r"i (don'?t|cannot) have.*(access|visibility)", re.IGNORECASE)
+    r"no (direct )?path (to|between)|there[’']s no (way|tunnel)|"
+    r"i (don[’']t|cannot|can[’']t) have.*(access|visibility|permission)", re.IGNORECASE)
 
 TOOL_NUDGE = (
     "(Immediate instruction from the operator: stop describing tool limitations. "
