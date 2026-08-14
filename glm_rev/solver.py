@@ -195,8 +195,16 @@ def register_solver(solver, token: str = "") -> None:
     if solver is not None and hasattr(solver, "_token") and not solver._token:
         solver._token = _registered_token
     ca.set_device_collector(_default_device_collector)
+    if solver is None:
+        # Startup: record token + collector, but DON'T start the pool yet.
+        # Previous-process disk tokens are dead (F001) and would arm the
+        # 35s backoff before the warm browser harvests fresh ones. The pool
+        # starts only when the live solver registers after _open() completes.
+        ca.device_tokens.clear()
+        return
+    ca.reset_backoff()
     ca.ensure_started()
-    if ca.enabled() and solver is not None:
+    if ca.enabled():
         # Block briefly so the pool has a payload ready for the first request.
         ca.warm(timeout=15.0)
 

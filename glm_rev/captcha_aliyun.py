@@ -88,6 +88,13 @@ def set_device_collector(cb):
         _DEVICE_COLLECTOR = cb
 
 
+def reset_backoff():
+    """Clear the failure cooldown gate (e.g. after a fresh browser harvest)."""
+    global _FAIL_BACKOFF_UNTIL
+    with _device_lock:
+        _FAIL_BACKOFF_UNTIL = 0.0
+
+
 def _collect_device_tokens():
     with _device_lock:
         cb = _DEVICE_COLLECTOR
@@ -431,7 +438,9 @@ class DeviceTokenPool:
                     added += 1
             if added:
                 self._persist()
-            return added
+        if added:
+            reset_backoff()
+        return added
 
     def _persist(self):
         try:
