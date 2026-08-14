@@ -16,7 +16,7 @@ from typing import List, Optional, Union
 
 from glm_rev.solver import steal_captcha, CaptchaSolver, register_solver
 from glm_rev.client import create_chat, refresh_token, build_features
-from glm_rev.config import BASE, ENDPOINT
+from glm_rev.config import BASE, ENDPOINT, parse_tool_calls, strip_tool_lines
 from glm_rev.api import sign, headers, user_id_from_token
 from glm_rev.tools import send_with_tools
 from glm_rev.mcp import MCPManager, load_mcp_config
@@ -425,6 +425,180 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
     }
 
 
+def _tools_contract(tools) -> str:
+    """Render the client's tool schemas into a TOOL:-line text contract."""
+    lines = [
+        "You are a coding agent. To invoke a tool, emit exactly one line:",
+        "  TOOL:<name>({\"arg\": \"value\", ...})",
+        "Then the caller executes it and returns the result as a [Tool result] message.",
+        "Continue emitting TOOL: lines until you have all data, then give your final answer.",
+        "Available tools:",
+    ]
+    for i, t in enumerate(tools or []):
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", t) or {}
+        name = fn.get("name") or t.get("name") or f"tool_{i}"
+        desc = (fn.get("description") or t.get("description") or "").strip()
+        params = fn.get("parameters") or t.get("parameters") or {}
+        lines.append(f"- {name}: {desc}")
+        if params:
+            lines.append(f"  args schema: {json.dumps(params)}")
+    return "\n".join(lines)
+
+
+async def _run_client_tools(req: ChatCompletionRequest, token: str):
+    """OpenAI-compatible client-side tool calling.
+
+    Builds a TOOL:-line contract from the client's tool schemas, sends it to
+    GLM as a normal prompt, parses TOOL: calls out of the reply, and streams
+    them back as standard delta.tool_calls + finish_reason:"tool_calls" for the
+    harness (Cline/Aider/Cursor) to execute. The harness sends role:"tool"
+    results back, which are re-injected as [Tool result] text on the next call.
+    """
+    if not req.tools:
+        raise HTTPException(status_code=400, detail="tools required for client-side mode")
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="No messages")
+
+    contract = _tools_contract(req.tools)
+    formatted_messages = []
+    for i, m in enumerate(req.messages):
+        content = m.content
+        if isinstance(content, list):
+            content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+        role = m.role
+        if role == "user":
+            if i == len(req.messages) - 1:
+                content = f"{contract}\n\n{content}"
+            formatted_messages.append({"role": "user", "content": content})
+        elif role == "assistant":
+            formatted_messages.append({"role": "assistant", "content": content or ""})
+        elif role == "tool":
+            tid = m.tool_call_id or m.name or "?"
+            formatted_messages.append({"role": "user",
+                                       "content": f"[Tool result for {tid}]: {content}"})
+    prompt = formatted_messages[-1]["content"]
+
+    chat_model = MODEL_ALIASES.get(req.model or "glm-5.2", req.model or "glm-5.2")
+    captcha, cookie = await acquire_captcha(token)
+    chat_id, msg_id = create_chat(token, prompt, model=chat_model, cookie=cookie,
+                                  enable_thinking=req.enable_thinking,
+                                  reasoning_effort=req.reasoning_effort)
+    sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
+                               current_url=f"{BASE}/c/{chat_id}")
+    url = f"{BASE}{ENDPOINT}?{url_params}&signature_timestamp={ts}"
+    params = {"max_tokens": req.max_tokens, "temperature": req.temperature, "top_p": 0.95}
+
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    created = int(time.time())
+
+    def chunk(delta=None, tool_calls=None, finish_reason=None, role=None):
+        d = {}
+        if role:
+            d["role"] = role
+        if delta:
+            d["content"] = delta
+        if tool_calls:
+            d["tool_calls"] = tool_calls
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": chat_model,
+            "choices": [{"index": 0, "delta": d, "finish_reason": finish_reason}],
+        }
+
+    reasoning_buf, text_buf = [], []
+    for line in requests.post(
+        url, headers=headers(token, sig, cookie), stream=True, timeout=120,
+        json={
+            "background_tasks": {"title_generation": True, "tags_generation": True},
+            "chat_id": chat_id,
+            "current_user_message_id": msg_id,
+            "current_user_message_parent_id": None,
+            "extra": {},
+            "features": build_features(req.enable_thinking, req.reasoning_effort, req.web_search),
+            "id": str(uuid.uuid4()),
+            "messages": formatted_messages,
+            "model": chat_model,
+            "params": params,
+            "signature_prompt": prompt,
+            "stream": True,
+            "variables": {},
+            "captcha_verify_param": captcha,
+        },
+    ).iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            inner = json.loads(data).get("data", {})
+        except Exception:
+            continue
+        delta = inner.get("delta_content") or ""
+        if not delta:
+            continue
+        if inner.get("phase") == "thinking":
+            reasoning_buf.append(delta)
+        else:
+            text_buf.append(delta)
+
+    full_text = "".join(text_buf)
+    reasoning = "".join(reasoning_buf)
+    calls = parse_tool_calls(full_text)
+
+    if calls:
+        tool_calls = [{
+            "index": i,
+            "id": f"call_{i}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args or {}, ensure_ascii=False)},
+        } for i, (name, args, _matched) in enumerate(calls)]
+
+        if req.stream:
+            async def gen():
+                yield f"data: {json.dumps(chunk(tool_calls=tool_calls, delta=None, role='assistant'))}\n\n"
+                yield f"data: {json.dumps(chunk(finish_reason='tool_calls'))}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(gen(), media_type="text/event-stream")
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": chat_model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls",
+            }],
+        }
+
+    answer = strip_tool_lines(full_text)
+    message = {"role": "assistant", "content": answer or None}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if req.stream:
+        async def gen():
+            yield f"data: {json.dumps(chunk_init(completion_id, created, chat_model))}\n\n"
+            if reasoning:
+                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': chat_model, 'choices': [{'index': 0, 'delta': {'reasoning_content': reasoning}, 'finish_reason': None}]})}\n\n"
+            if answer:
+                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': chat_model, 'choices': [{'index': 0, 'delta': {'content': answer}, 'finish_reason': None}]})}\n\n"
+            yield f"data: {json.dumps(chunk(finish_reason='stop'))}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(gen(), media_type="text/event-stream")
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": chat_model,
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     try:
@@ -432,6 +606,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         token = refresh_token(token)
 
         if req.tools:
+            if os.environ.get("GLM_CLIENT_TOOLS") in ("1", "true", "yes"):
+                return await _run_client_tools(req, token)
             return await _run_with_tools(req, token)
 
         formatted_messages = []

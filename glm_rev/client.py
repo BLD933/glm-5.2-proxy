@@ -27,14 +27,18 @@ def split_reasoning(text):
 def stream_turn(*, token, cookie, sig, url, chat_id, model, messages,
                 current_user_message_id, current_user_message_parent_id,
                 is_first, features, params, captcha, debug_sse=False,
-                on_thinking=None, on_answer=None):
+                on_thinking=None, on_answer=None, signature_prompt_override=None):
     """Send one chat.completions turn and capture the full streamed output.
 
     Returns a dict with keys: full, reasoning, answer, id, parent, usage,
     stream_error, stream_status, captcha_error — or {"error": str} on
     transport/HTTP failure. Does not print anything (except optional SSE debug).
     `signature_prompt` is derived from the last message so callers must build
-    the signature with sign(last_message_content, ...)."""
+    the signature with sign(last_message_content, ...); pass
+    `signature_prompt_override` when the effective prompt (e.g. a tool
+    contract) differs from messages[-1]["content"]."""
+    sig_prompt = signature_prompt_override if signature_prompt_override is not None else (
+        messages[-1]["content"] if messages else "")
     body = {
         "chat_id": chat_id,
         "current_user_message_id": current_user_message_id,
@@ -45,7 +49,7 @@ def stream_turn(*, token, cookie, sig, url, chat_id, model, messages,
         "messages": messages,
         "model": model,
         "params": params,
-        "signature_prompt": messages[-1]["content"] if messages else "",
+        "signature_prompt": sig_prompt,
         "stream": True,
         "variables": {},
         "captcha_verify_param": captcha,
