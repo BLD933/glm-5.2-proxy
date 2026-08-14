@@ -34,7 +34,9 @@ def execute_tool(name, args):
     """Execute a tool call locally. Returns (ok, text_result)."""
     try:
         if name == "read_file":
-            p = os.path.expanduser(args["path"])
+            raw_p = str(args.get("path", "")).strip("\"'")
+            if raw_p in ("path:", ""): raw_p = "."
+            p = os.path.expanduser(raw_p)
             with open(p, "rb") as f:
                 data = f.read(256 * 1024 + 1)
             text = data.decode("utf-8", "replace")
@@ -43,17 +45,21 @@ def execute_tool(name, args):
             numbered = "\n".join(f"{i + 1:6d}| {ln}" for i, ln in enumerate(text.split("\n")))
             return True, numbered
         if name == "list_dir":
-            p = os.path.expanduser(args["path"])
+            raw_p = str(args.get("path", "")).strip("\"'")
+            if raw_p in ("path:", ""): raw_p = "."
+            p = os.path.expanduser(raw_p)
             entries = sorted(os.listdir(p))
             return True, "\n".join(entries[:500]) if entries else "(empty)"
         if name == "write_file":
-            p = os.path.expanduser(args["path"])
+            raw_p = str(args.get("path", "")).strip("\"'")
+            p = os.path.expanduser(raw_p)
             os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
             with open(p, "w") as f:
                 f.write(args.get("content", ""))
             return True, f"wrote {len(args.get('content', ''))} bytes to {p}"
         if name == "edit_lines":
-            p = os.path.expanduser(args["path"])
+            raw_p = str(args.get("path", "")).strip("\"'")
+            p = os.path.expanduser(raw_p)
             start = int(args.get("start", 1))
             delete = int(args.get("delete", 0))
             if start < 1:
@@ -72,17 +78,22 @@ def execute_tool(name, args):
                           f"with {len(content.split(chr(10)))} new line(s) "
                           f"({before} -> {len(lines)} lines total)")
         if name == "run_command":
-            cmd = args.get("cmd") or args.get("command")
+            cmd = str(args.get("cmd") or args.get("command") or "").strip()
+            if not cmd:
+                return False, "No command provided"
             r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
             out = (r.stdout or "") + (("\n[stderr] " + r.stderr) if r.stderr else "")
             return r.returncode == 0, (out[:50000] or "(no output)") + f" [exit {r.returncode}]"
         if name == "web_fetch":
             from urllib.parse import urlparse
+            raw_url = str(args.get("url", "")).strip("\"'")
+            if not raw_url.startswith(("http://", "https://")):
+                raw_url = "https://" + raw_url
             import urllib.request
-            u = urlparse(args["url"])
+            u = urlparse(raw_url)
             if u.scheme not in ("http", "https"):
                 return False, "only http/https allowed"
-            req = urllib.request.Request(args["url"], headers={"User-Agent": UA})
+            req = urllib.request.Request(raw_url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = resp.read(5 * 1024 * 1024 + 1)
             text = data.decode("utf-8", "replace")

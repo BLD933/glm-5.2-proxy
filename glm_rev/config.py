@@ -166,6 +166,60 @@ def _map_positional(name, value):
     return dict(zip(keys, values))
 
 
+def _parse_bare_args(canonical, raw_str):
+    raw_str = raw_str.strip()
+    if not raw_str:
+        return {"path": "."} if canonical == "list_dir" else {}
+    
+    # 0. Invalid dict literal (e.g. {path="/tmp/x"})
+    if raw_str.startswith("{") and raw_str.endswith("}"):
+        return {}
+    
+    # 1. If run_command: capture the whole command string
+    if canonical == "run_command":
+        m = re.match(r'^(?:cmd|command)\s*[:=]\s*(.*)$', raw_str, re.IGNORECASE)
+        val = m.group(1).strip() if m else raw_str
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        return {"cmd": val}
+    
+    # 2. Single-arg tools (read_file, list_dir, web_fetch)
+    if canonical in ("read_file", "list_dir", "web_fetch"):
+        m = re.match(r'^(?:path|file|dir|url)\s*[:=]\s*(.*)$', raw_str, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip()
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            else:
+                val = val.split(None, 1)[0].strip("\"'")
+        else:
+            if (raw_str.startswith('"') and raw_str.endswith('"')) or (raw_str.startswith("'") and raw_str.endswith("'")):
+                val = raw_str[1:-1]
+            else:
+                val = raw_str.split(None, 1)[0].strip("\"'")
+        if canonical == "web_fetch":
+            return {"url": val}
+        return {"path": val}
+    
+    # 3. Multi-arg tools (write_file, edit_lines)
+    kv_pattern = r'([A-Za-z_][A-Za-z0-9_-]*)\s*[:=]\s*(?:"([^"]*)"|\'([^\']*)\'|(\S+))'
+    matches = re.findall(kv_pattern, raw_str)
+    if matches:
+        res = {}
+        for k, v1, v2, v3 in matches:
+            val = v1 if v1 != "" else (v2 if v2 != "" else v3)
+            try:
+                val = int(val)
+            except ValueError:
+                pass
+            res[k] = val
+        return res
+    
+    # 4. Fallback positional token
+    token = raw_str.split(None, 1)[0].strip("\"'")
+    return _map_positional(canonical, token)
+
+
 def parse_tool_calls(text):
     """Return [(name, args_dict, matched_text), ...] for ALL TOOL: calls.
     Accepts bare names (TOOL: list_files), bare JSON args, and positional
@@ -193,22 +247,30 @@ def parse_tool_calls(text):
                 continue
             raw = text[k + 1:end - 1] if text[k] == "(" else text[k:end]
             matched_end = end
+            args = None
+            if raw.strip():
+                try:
+                    args = json.loads(raw)
+                except Exception:
+                    try:
+                        args = ast.literal_eval(raw)
+                    except Exception:
+                        pass
+            if args is None:
+                args = _parse_bare_args(canonical, raw)
+            elif not isinstance(args, dict):
+                args = _map_positional(canonical, args)
         else:
-            raw = ""
-            matched_end = j
-        try:
-            args = json.loads(raw) if raw.strip() else {}
-        except json.JSONDecodeError:
-            try:
-                args = ast.literal_eval(raw) if raw.strip() else {}
-            except (ValueError, SyntaxError):
-                args = {}
-        if not isinstance(args, dict):
-            args = _map_positional(canonical, args)
-        if not raw.strip():
-            rest = text[k:].split(None, 1)
-            if rest and not text[k:].startswith("TOOL"):
-                args = _map_positional(canonical, rest[0])
+            eol = text.find("\n", k)
+            if eol < 0:
+                eol = len(text)
+            next_tool = text.find("TOOL:", k)
+            if next_tool >= 0 and next_tool < eol:
+                eol = next_tool
+            raw_str = text[k:eol]
+            args = _parse_bare_args(canonical, raw_str)
+            has_kv = bool(re.search(r'^[A-Za-z_][A-Za-z0-9_-]*\s*[:=]', raw_str.strip()))
+            matched_end = eol if has_kv else j
         if canonical == "list_dir" and "path" not in args:
             args = dict(args)
             args["path"] = "."
