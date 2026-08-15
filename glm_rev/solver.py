@@ -46,6 +46,62 @@ PATCH_JS = r"""
 })()
 """
 
+# Stealth fingerprint masking so headless Chromium reads as desktop Chrome to
+# Aliyun's FEILIN engine. Runs in every frame before page scripts; fully
+# synchronous IIFE, every override try/catch-guarded so it never breaks
+# PATCH_JS/WARM_JS/COLLECT_JS (none of which read webdriver/chrome/WebGL/audio).
+MASK_JS = r"""
+(function() {
+  try {
+    var _wd = navigator.webdriver;
+    Object.defineProperty(navigator, 'webdriver', {
+      get: function() { return undefined; },
+      configurable: true
+    });
+  } catch (e) {}
+
+  try {
+    if (typeof window.chrome === 'undefined' || !window.chrome) {
+      window.chrome = {
+        runtime: { OnInstalledReason: { INSTALL: 'install' } },
+        loadTimes: function() { return {}; },
+        csi: function() { return {}; }
+      };
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof WebGLRenderingContext !== 'undefined' && WebGLRenderingContext.prototype) {
+      var _origGetParam = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445 || param === WebGLRenderingContext.UNMASKED_VENDOR_WEBGL) return 'Google Inc. (Intel)';
+        if (param === 37446 || param === WebGLRenderingContext.UNMASKED_RENDERER_WEBGL) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return _origGetParam.call(this, param);
+      };
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof AudioContext !== 'undefined' && AudioContext.prototype) {
+      var _t = 0.0;
+      var _audioProto = AudioContext.prototype;
+      Object.defineProperty(_audioProto, 'sampleRate', { get: function() { return 48000; } });
+      Object.defineProperty(_audioProto, 'currentTime', { get: function() { _t += 0.004; return _t; } });
+      Object.defineProperty(_audioProto, 'state', { get: function() { return 'running'; } });
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof OfflineAudioContext !== 'undefined' && OfflineAudioContext.prototype) {
+      var _offProto = OfflineAudioContext.prototype;
+      Object.defineProperty(_offProto, 'sampleRate', { get: function() { return 48000; } });
+      Object.defineProperty(_offProto, 'currentTime', { get: function() { return 0.0; } });
+      Object.defineProperty(_offProto, 'state', { get: function() { return 'suspended'; } });
+    }
+  } catch (e) {}
+})()
+"""
+
 WARM_JS = r"""
 async () => {
   if (typeof window.z_um !== 'undefined' && typeof window.z_um.getToken === 'function') {
@@ -258,6 +314,7 @@ async def _oneshot_impl(token: str, count: int) -> list[str]:
                 viewport={"width": 1920, "height": 1080},
                 user_agent=UA, locale="en-US")
             page = await ctx.new_page()
+            await page.add_init_script(MASK_JS)
             await page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=40000)
             await _wait_for(page, "body", 15000)
             await page.evaluate(
@@ -463,6 +520,7 @@ class CaptchaSolver:
         self._token = token
         page = await self._ctx.new_page()
         self._page = page
+        await page.add_init_script(MASK_JS)
         await page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=40000)
         await _wait_for(page, "body", 15000)
         await page.evaluate(
