@@ -364,7 +364,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
         it += 1
 
         hist.append({"role": "user", "content": content})
-        hist.append({"role": "assistant", "content": strip_tool_lines(text)})
+        hist.append({"role": "assistant", "content": text})
         state["last_assistant_id"] = last_ast_id
         if res.get("parent"):
             state["last_assistant_parent_id"] = res["parent"]
@@ -398,7 +398,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
                 return False, err
             res, text = err
             hist.append({"role": "user", "content": content})
-            hist.append({"role": "assistant", "content": strip_tool_lines(text)})
+            hist.append({"role": "assistant", "content": text})
             out = strip_tool_lines(text)
             if writer is not None:
                 writer.write(out)
@@ -452,7 +452,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
                 return False, err
             res, text = err
             hist.append({"role": "user", "content": content})
-            hist.append({"role": "assistant", "content": strip_tool_lines(text)})
+            hist.append({"role": "assistant", "content": text})
             out = strip_tool_lines(text)
             if writer is not None:
                 writer.write(out)
