@@ -36,6 +36,8 @@ run tests/regression/test_refusal.py
 run tests/regression/test_history_commit.py
 run tests/regression/test_inflight_hist.py
 run tests/regression/test_memory.py
+run tests/regression/test_jitter.py
+run tests/regression/test_masking.py
 
 if [ $FAILED -ne 0 ]; then
   echo "=== SOME TESTS FAILED ==="
