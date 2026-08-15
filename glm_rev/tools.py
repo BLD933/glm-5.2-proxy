@@ -221,6 +221,23 @@ def _fmt_error(res, debug_sse):
     return msg
 
 
+def _commit_history(prior, is_first, mcp, prompt, text):
+    """Persist only the clean (user: prompt, assistant: final_answer) pair for a
+    completed tool turn, dropping in-flight loop artifacts ([Tool result],
+    DECLINED, TOOL_NUDGE, TOOL_HINT, empty TOOL-only replies) from history so
+    later turns don't replay operator directives to the model."""
+    clean = list(prior)
+    if is_first and not clean:
+        clean.append({"role": "user",
+                      "content": build_contract(mcp) + "\n\nUser: " + prompt})
+    else:
+        clean.append({"role": "user", "content": prompt})
+    answer = strip_tool_lines(text).strip()
+    if answer:
+        clean.append({"role": "assistant", "content": answer})
+    return clean[-120:]
+
+
 def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=False,
                     auto_approve=False, writer=None, captcha_fn=None, on_token=None):
     """Prompt + tool loop adapted to glm-rev.
@@ -250,6 +267,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
         state["chat_id"] = chat_id
 
     hist = list(state["history"])
+    prior = list(state["history"])
     last_ast_id = state.get("last_assistant_id")
 
     def send(content, first):
@@ -367,7 +385,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
                 writer.write(out)
             elif md is not None:
                 md.write(out)
-            state["history"] = hist[-120:]
+            state["history"] = _commit_history(prior, is_first, mcp, prompt, text)
             return True, None
 
         if it >= MAX_TOOL_ITERS:
@@ -386,7 +404,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
                 writer.write(out)
             elif md is not None:
                 md.write(out)
-            state["history"] = hist[-120:]
+            state["history"] = _commit_history(prior, is_first, mcp, prompt, text)
             return True, None
 
         seen_before = set(seen.keys())
@@ -440,5 +458,5 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
                 writer.write(out)
             elif md is not None:
                 md.write(out)
-            state["history"] = hist[-120:]
+            state["history"] = _commit_history(prior, is_first, mcp, prompt, text)
             return True, None

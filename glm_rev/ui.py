@@ -684,8 +684,9 @@ def run_repl(token, start_model="glm-5.2", no_pretty=False, start_think=True,
                 print(f"\n[!] {err}", file=sys.stderr)
             else:
                 state["transcript"].append({"role": "user", "text": inp})
-                state["transcript"].append({"role": "assistant",
-                                            "text": state["history"][-1]["content"]})
+                if state["history"] and state["history"][-1].get("role") == "assistant":
+                    state["transcript"].append({"role": "assistant",
+                                                "text": state["history"][-1]["content"]})
                 if pretty:
                     md.finish()
                 print()
