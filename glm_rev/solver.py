@@ -402,7 +402,8 @@ class CaptchaSolver:
             # another re-arming verify during its cooldown.
             try:
                 device_token = None
-                if time.time() >= ca._FAIL_BACKOFF_UNTIL:
+                if (time.time() >= ca._FAIL_BACKOFF_UNTIL
+                        and time.time() >= ca._F001_UNTIL):
                     device_token = ca.device_tokens.pop()
                 if not device_token and self._page is not None:
                     tokens = self.collect_tokens(token, count=150)
@@ -494,15 +495,19 @@ class CaptchaSolver:
             print(f"[solver] _open harvest raised {type(e).__name__}: {e}", file=sys.stderr)
         # Authoritative in-memory path: compute a fresh captcha from a
         # harvested device token instead of serving the DOM token.
-        try:
-            device_token = ca.device_tokens.pop()
-            if device_token:
-                payload = ca.compute_final(device_token)
-                if payload:
-                    return payload, None
-                print("[!] _open: compute_final returned None (verify rejected)", file=sys.stderr)
-        except Exception as e:
-            print(f"[!] _open: compute_final raised {type(e).__name__}: {e}", file=sys.stderr)
+        if time.time() < ca._F001_UNTIL:
+            print("[solver] _open skipping authoritative compute (F001 pause)",
+                  file=sys.stderr)
+        else:
+            try:
+                device_token = ca.device_tokens.pop()
+                if device_token:
+                    payload = ca.compute_final(device_token)
+                    if payload:
+                        return payload, None
+                    print("[!] _open: compute_final returned None (verify rejected)", file=sys.stderr)
+            except Exception as e:
+                print(f"[!] _open: compute_final raised {type(e).__name__}: {e}", file=sys.stderr)
         return None, None
 
     async def _collect_coro(self, token: str, count: int) -> list[str]:

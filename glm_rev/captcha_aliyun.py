@@ -67,6 +67,14 @@ _MIN_GEN_INTERVAL_S = 6.0
 _FAIL_BACKOFF_S = 35.0
 _FAIL_BACKOFF_UNTIL = 0.0
 
+# First F001 rejection aborts ALL further verifies process-wide for ~300s (the
+# documented ~10-min device recovery window). The 240s token TTL already
+# filters stale tokens (the only benign F001 cause), so a fresh-token F001 =
+# flagged device. Consecutive verify attempts re-arm the flag, so abort on the
+# first one and let the device cool down instead of burning the whole batch.
+_F001_PAUSE_S = 300.0
+_F001_UNTIL = 0.0
+
 # _compute_with_refill tries at most 3 pool tokens (range(3)) before arming
 # the shared backoff, so a flagged device is never hammered with rapid
 # verify bursts (each compute_final = 1 verify; ~2-3 re-flag the device).
@@ -90,9 +98,10 @@ def set_device_collector(cb):
 
 def reset_backoff():
     """Clear the failure cooldown gate (e.g. after a fresh browser harvest)."""
-    global _FAIL_BACKOFF_UNTIL
+    global _FAIL_BACKOFF_UNTIL, _F001_UNTIL
     with _device_lock:
         _FAIL_BACKOFF_UNTIL = 0.0
+        _F001_UNTIL = 0.0
 
 
 def _collect_device_tokens():
@@ -312,7 +321,15 @@ def verify_captcha(certify_id: str, data_value: str, device_token: str) -> str |
     resp = _http_post(VERIFY_URL, build_query_string(params), {"Referer": ""})
     data = json.loads(resp)
     if not data.get("Success") or not (data.get("Result") or {}).get("VerifyResult"):
-        print(f"[verify_captcha] rejected: {resp[:400]}", file=sys.stderr)
+        vcode = (data or {}).get("VerifyCode")
+        if vcode == "F001":
+            global _F001_UNTIL
+            with _device_lock:
+                _F001_UNTIL = time.time() + _F001_PAUSE_S
+            print("[verify_captcha] F001 risk-control flag; pausing verifies for 300s",
+                  file=sys.stderr)
+        else:
+            print(f"[verify_captcha] rejected: {resp[:400]}", file=sys.stderr)
         return None
     result = data.get("Result") or {}
     security_token = result.get("securityToken")
@@ -526,7 +543,8 @@ class CaptchaPool:
                 # bursts against a flagged device amplify F001.
                 paced = (time.time() - self._last_gen) >= (
                     _MIN_GEN_INTERVAL_S + random.uniform(-1.5, 1.5))
-                backoff_clear = time.time() >= _FAIL_BACKOFF_UNTIL
+                backoff_clear = (time.time() >= _FAIL_BACKOFF_UNTIL
+                                 and time.time() >= _F001_UNTIL)
                 if needed > 0 and self._generating == 0 and paced and backoff_clear:
                     self._generating += 1
                     self._last_gen = time.time()
@@ -588,6 +606,11 @@ class CaptchaPool:
                 return payload
             with _device_lock:
                 _FAIL_BACKOFF_UNTIL = time.time() + _FAIL_BACKOFF_S
+            # First F001 arms a 300s process-wide abort: stop the loop NOW
+            # instead of running attempts 2-3 (each extra verify re-arms F001).
+            with _device_lock:
+                if time.time() < _F001_UNTIL:
+                    return None
         return None
 
 

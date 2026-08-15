@@ -9,14 +9,18 @@ Covers:
 6. compute_final raises HTTPError (request landed) -> backoff IS armed.
 7. compute_final raises URLError (transient network) -> backoff stays 0.0.
 """
+import asyncio
+import json
 import sys
 import threading
 import time
+import types
 import urllib.error
 
 sys.path.insert(0, "/home/bld/glm-rev")
 
 from glm_rev import captcha_aliyun as ca
+import glm_rev.solver as solver_mod
 
 
 class _FakeTokens:
@@ -51,11 +55,51 @@ def _compute(token):
     return "OK" if token.startswith("good") else None
 
 
+class _FakePage:
+    async def goto(self, *a, **k):
+        return None
+
+    async def evaluate(self, js, *args):
+        if "const out" in str(js):
+            return []
+        return True
+
+    async def add_init_script(self, js):
+        return None
+
+    async def wait_for_selector(self, *a, **k):
+        return None
+
+
+class _FakeCtx:
+    async def new_page(self, *a, **k):
+        return _FakePage()
+
+
+class _FakeBrowser:
+    async def new_context(self, *a, **k):
+        return _FakeCtx()
+
+
+class _FakePlaywright:
+    async def start(self):
+        return self
+
+    @property
+    def chromium(self):
+        return self
+
+    async def launch(self, *a, **k):
+        return _FakeBrowser()
+
+
 def main():
     failures = 0
+    total = 0
 
     def check(name, cond, detail=""):
-        nonlocal failures
+        nonlocal failures, total
+        total += 1
         print(f"{'PASS' if cond else 'FAIL'} {name} {detail}")
         if not cond:
             failures += 1
@@ -159,11 +203,116 @@ def main():
           f"payload={payload!r} backoff={ca._FAIL_BACKOFF_UNTIL}")
     assert payload is None and ca._FAIL_BACKOFF_UNTIL == 0.0, "S7 regression"
 
+    # ---- Scenario 8: verify_captcha sees F001 inside a Success response ->
+    # arms the 300s process-wide pause and returns None.
+    ca._F001_UNTIL = 0.0
+    orig_http = ca._http_post
+
+    def fake_http_f001(url, body, extra_headers=None, retries=3):
+        return json.dumps({"Success": True, "Result": {"VerifyResult": False},
+                           "VerifyCode": "F001", "CertifyId": "x"})
+
+    ca._http_post = fake_http_f001
+    out = ca.verify_captcha("cid", "dv", "tok")
+    armed_f001 = ca._F001_UNTIL > time.time()
+    check("S8 F001 verify arms _F001_UNTIL and returns None",
+          out is None and armed_f001, f"out={out!r} f001={ca._F001_UNTIL!r}")
+    assert out is None and armed_f001, "S8 regression"
+    prev_f001 = ca._F001_UNTIL
+
+    # ---- Scenario 9: a non-F001 rejection leaves _F001_UNTIL untouched.
+    def fake_http_plain(url, body, extra_headers=None, retries=3):
+        return json.dumps({"Success": True, "Result": {"VerifyResult": False},
+                           "VerifyCode": "E002", "CertifyId": "x"})
+
+    ca._http_post = fake_http_plain
+    out = ca.verify_captcha("cid", "dv", "tok")
+    check("S9 non-F001 rejection leaves _F001_UNTIL untouched",
+          out is None and ca._F001_UNTIL == prev_f001,
+          f"out={out!r} f001={ca._F001_UNTIL!r} prev={prev_f001!r}")
+    assert out is None and ca._F001_UNTIL == prev_f001, "S9 regression"
+
+    # ---- Scenario 10: first compute_final None arms _F001_UNTIL (mimicking
+    # verify_captcha's arming in the real flow) -> _compute_with_refill aborts
+    # after exactly one attempt instead of trying tokens 2-3.
+    ca._F001_UNTIL = 0.0
+    ca._FAIL_BACKOFF_UNTIL = 0.0
+    f001_calls = []
+
+    def f001_compute(token):
+        f001_calls.append(token)
+        with ca._device_lock:
+            ca._F001_UNTIL = time.time() + ca._F001_PAUSE_S
+        return None
+
+    ca.device_tokens = _FakeTokens("t1", "t2", "t3")
+    ca._collect_device_tokens = _fresh_collect_none
+    ca.compute_final = f001_compute
+    payload = pool._compute_with_refill()
+    armed = ca._F001_UNTIL > time.time()
+    check("S10 first-F001 aborts loop after exactly one attempt",
+          payload is None and armed and len(f001_calls) == 1,
+          f"payload={payload!r} armed={armed} calls={f001_calls!r}")
+    assert payload is None and armed and len(f001_calls) == 1, "S10 regression"
+
+    # ---- Scenario 11: reset_backoff clears the F001 gate too (fresh harvest
+    # can lift the abort).
+    ca._F001_UNTIL = time.time() + 100.0
+    ca.reset_backoff()
+    check("S11 reset_backoff clears _F001_UNTIL",
+          ca._F001_UNTIL == 0.0 and ca._FAIL_BACKOFF_UNTIL == 0.0,
+          f"f001={ca._F001_UNTIL!r} backoff={ca._FAIL_BACKOFF_UNTIL!r}")
+    assert ca._F001_UNTIL == 0.0, "S11 regression"
+
+    # ---- Scenario 12: the _run gate (backoff_clear expression) blocks
+    # generator spawn while _F001_UNTIL is in the future.
+    ca._F001_UNTIL = time.time() + 100.0
+    ca._FAIL_BACKOFF_UNTIL = 0.0
+    gate_clear = (time.time() >= ca._FAIL_BACKOFF_UNTIL
+                  and time.time() >= ca._F001_UNTIL)
+    check("S12 _run gate blocked during F001 pause", not gate_clear,
+          f"gate_clear={gate_clear}")
+    assert not gate_clear, "S12 regression"
+    ca._F001_UNTIL = 0.0
+
+    # ---- Scenario 13: solver _open skips the authoritative compute_final
+    # while the F001 pause is armed, but runs it once the pause lifts.
+    _pw_root = types.ModuleType("playwright")
+    _pw_api = types.ModuleType("playwright.async_api")
+    _pw_api.async_playwright = lambda: _FakePlaywright()
+    sys.modules["playwright"] = _pw_root
+    sys.modules["playwright.async_api"] = _pw_api
+
+    ca._F001_UNTIL = time.time() + 300.0
+    ca._FAIL_BACKOFF_UNTIL = 0.0
+    open_calls = []
+
+    def open_compute(token):
+        open_calls.append(token)
+        return "PAYLOAD"
+
+    ca.device_tokens = _FakeTokens("tok1", "tok2")
+    ca.compute_final = open_compute
+    solver = solver_mod.CaptchaSolver()
+    out = asyncio.run(solver._open("tok"))
+    check("S13 _open skips authoritative compute during F001 pause",
+          out == (None, None) and not open_calls, f"out={out!r} calls={open_calls!r}")
+    assert out == (None, None) and not open_calls, "S13 regression"
+
+    ca._F001_UNTIL = 0.0
+    out = asyncio.run(solver._open("tok"))
+    check("S13b _open computes authoritatively once pause lifts",
+          out == ("PAYLOAD", None) and len(open_calls) == 1,
+          f"out={out!r} calls={open_calls!r}")
+    assert out == ("PAYLOAD", None) and len(open_calls) == 1, "S13b regression"
+
     ca._FAIL_BACKOFF_UNTIL = old_backoff
+    ca._F001_UNTIL = 0.0
     ca.device_tokens = _FakeTokens()
     ca.compute_final = orig_compute
+    ca._http_post = orig_http
 
-    print(f"\n{7 - failures}/7 scenarios passed")
+    print(f"\n{total - failures}/{total} scenarios passed")
     sys.exit(1 if failures else 0)
 
 
