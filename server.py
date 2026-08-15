@@ -300,7 +300,35 @@ class _CaptureWriter:
         return "".join(self.parts)
 
 
+def _tool_messages(req: ChatCompletionRequest) -> list:
+    """Sanitize OpenAI messages into GLM user/assistant {role, content} dicts.
+
+    list-content (multimodal) is joined by text parts, role "tool" results are
+    wrapped as user messages ("[Tool result for <id>]: ..."), and role "system"
+    is dropped (GLM has no system role; the contract covers that duty)."""
+    out = []
+    for m in req.messages:
+        content = m.content
+        if isinstance(content, list):
+            content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+        if m.role == "tool":
+            tid = m.tool_call_id or m.name or "?"
+            out.append({"role": "user", "content": f"[Tool result for {tid}]: {content}"})
+        elif m.role in ("user", "assistant"):
+            out.append({"role": m.role, "content": content or ""})
+    return out
+
+
 def _tool_state(req: ChatCompletionRequest, token: str) -> dict:
+    msgs = _tool_messages(req)
+    last_user = -1
+    sanitized = 0
+    for m in req.messages:
+        if m.role == "user":
+            last_user = sanitized
+        if m.role in ("user", "assistant", "tool"):
+            sanitized += 1
+    history = msgs[:last_user] if last_user >= 0 else []
     return {
         "token": token,
         "cookie": None,
@@ -313,7 +341,7 @@ def _tool_state(req: ChatCompletionRequest, token: str) -> dict:
         "chat_id": None,
         "last_assistant_id": None,
         "last_assistant_parent_id": None,
-        "history": [],
+        "history": history,
         "usage": {"prompts": 0, "in": 0, "out": 0},
         "solver": None,
     }
@@ -483,6 +511,7 @@ async def _run_client_tools(req: ChatCompletionRequest, token: str):
     chat_model = MODEL_ALIASES.get(req.model or "glm-5.2", req.model or "glm-5.2")
     captcha, cookie = await acquire_captcha(token)
     chat_id, msg_id = create_chat(token, prompt, model=chat_model, cookie=cookie,
+                                  messages=_tool_messages(req),
                                   enable_thinking=req.enable_thinking,
                                   reasoning_effort=req.reasoning_effort)
     sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
@@ -633,6 +662,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         chat_model = MODEL_ALIASES.get(chat_model, chat_model)
 
         chat_id, msg_id = create_chat(token, prompt, model=chat_model, cookie=cookie,
+                                      messages=_tool_messages(req),
                                       enable_thinking=req.enable_thinking,
                                       reasoning_effort=req.reasoning_effort)
         sig, url_params, ts = sign(prompt, user_id_from_token(token), token,

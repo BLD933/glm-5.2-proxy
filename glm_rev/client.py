@@ -184,10 +184,53 @@ def refresh_token(token: str) -> str:
 
 def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = None,
                 chat_id: str = None, msg_id: str = None,
-                enable_thinking: bool = True, reasoning_effort: str = "max") -> tuple[str, str]:
+                enable_thinking: bool = True, reasoning_effort: str = "max",
+                messages: list = None) -> tuple[str, str]:
+    """Create (or reuse) an upstream conversation.
+
+    `messages` is an optional list of {"role": "user"|"assistant", "content":
+    str} dicts. When given, the full linked-list message tree (parentId /
+    childrenIds / currentId) is seeded so the upstream conversation carries
+    the complete prior context, not just the latest prompt. Otherwise a single
+    user node is created from `prompt` (backward compatible). Returns
+    (chat_id, last_msg_id) where last_msg_id is the id of the final message
+    node, suitable for threading the first streamed turn."""
     chat_id = chat_id or str(uuid.uuid4())
-    msg_id = msg_id or str(uuid.uuid4())
     ts2 = int(time.time())
+
+    nodes = {}
+    parent = None
+    last_id = None
+    if messages:
+        for i, m in enumerate(messages):
+            mid = str(uuid.uuid4())
+            nodes[mid] = {
+                "id": mid,
+                "parentId": parent,
+                "childrenIds": [],
+                "role": m.get("role", "user"),
+                "content": m.get("content", ""),
+                "timestamp": ts2 + i,
+                "models": [model],
+            }
+            if parent is not None:
+                nodes[parent]["childrenIds"].append(mid)
+            parent = mid
+            last_id = mid
+    else:
+        msg_id = msg_id or str(uuid.uuid4())
+        nodes[msg_id] = {
+            "id": msg_id,
+            "parentId": None,
+            "childrenIds": [],
+            "role": "user",
+            "content": prompt,
+            "timestamp": ts2,
+            "models": [model],
+        }
+        parent = msg_id
+        last_id = msg_id
+
     chat_body = {
         "chat": {
             "id": chat_id,
@@ -195,18 +238,8 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             "models": [model],
             "params": {},
             "history": {
-                "messages": {
-                    msg_id: {
-                        "id": msg_id,
-                        "parentId": None,
-                        "childrenIds": [],
-                        "role": "user",
-                        "content": prompt,
-                        "timestamp": ts2,
-                        "models": [model],
-                    }
-                },
-                "currentId": msg_id,
+                "messages": nodes,
+                "currentId": parent,
             },
             "tags": [],
             "flags": [],
@@ -228,7 +261,7 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             chat_id = r.json().get("id", chat_id)
         except Exception:
             pass
-    return chat_id, msg_id
+    return chat_id, last_id
 
 
 def chat(prompt: str, token: str, model: str = "glm-5.2", chat_id: str = None,

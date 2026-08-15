@@ -258,12 +258,15 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
 
     chat_id = state["chat_id"]
     is_first = chat_id is None
+    seed_msg_id = None
     if is_first:
         print(f"{ANSI['dim']}[*] creating conversation...{ANSI['reset']}", file=sys.stderr)
-        chat_id, _ = create_chat(token, prompt, model=state["model"],
-                                 cookie=state["cookie"],
-                                 enable_thinking=state["enable_thinking"],
-                                 reasoning_effort=state["reasoning_effort"])
+        seed_msgs = list(state["history"]) + [{"role": "user", "content": prompt}]
+        chat_id, seed_msg_id = create_chat(token, prompt, model=state["model"],
+                                           cookie=state["cookie"],
+                                           messages=seed_msgs,
+                                           enable_thinking=state["enable_thinking"],
+                                           reasoning_effort=state["reasoning_effort"])
         state["chat_id"] = chat_id
 
     hist = list(state["history"])
@@ -288,7 +291,7 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
         captcha, cookie = fresh
         state["cookie"] = cookie
 
-        new_user_msg_id = str(uuid.uuid4())
+        new_user_msg_id = seed_msg_id if (first and seed_msg_id) else str(uuid.uuid4())
         parent_msg_id = None if first else last_ast_id
 
         rstream = ReasoningStream()
