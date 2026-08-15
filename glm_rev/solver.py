@@ -122,7 +122,7 @@ async (total) => {
     if (typeof window.z_um === 'undefined' || !window.z_um.getToken) return out;
     const tok = window.z_um.getToken();
     out.push((tok && typeof tok.then === 'function') ? await tok : tok);
-    if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 15 + Math.random() * 25));
   }
   return out;
 }
