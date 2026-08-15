@@ -312,6 +312,60 @@ def main():
     ca.compute_final = orig_compute
     ca._http_post = orig_http
 
+    # ---- Scenario 14: idle + empty pool parks generation (JIT idle gate).
+    # _should_generate maintains the active/idle gate and must refuse to spawn.
+    p14 = ca.CaptchaPool()
+    p14._last_active = time.time() - (ca._IDLE_PAUSE_S + 60.0)
+    p14._last_gen = 0.0
+    p14._generating = 0
+    p14._active = True
+    spawn = p14._should_generate(time.time())
+    check("S14 idle+empty pool parks generation",
+          spawn is False and p14._active is False and p14._generating == 0,
+          f"spawn={spawn} active={p14._active}")
+    assert spawn is False and p14._active is False, "S14 regression"
+
+    # ---- Scenario 15: demand via get() flips the pool back active.
+    p14.get()
+    check("S15 get() refreshes _last_active and marks pool active",
+          p14._active is True and time.time() - p14._last_active < 2.0,
+          f"active={p14._active} last_active_delta={time.time() - p14._last_active:.2f}s")
+    assert p14._active is True, "S15 regression"
+
+    # ---- Scenario 16: recent demand + spare capacity still spawns (warm serve).
+    p16 = ca.CaptchaPool()
+    p16._last_active = time.time()
+    p16._last_gen = time.time() - 100.0      # pacing gate clear
+    p16._generating = 0
+    p16._params = [(time.time(), "cached")]
+    spawn = p16._should_generate(time.time())
+    check("S16 warm serve preserved while active",
+          spawn is True and p16._active is True,
+          f"spawn={spawn} active={p16._active}")
+    assert spawn is True, "S16 regression"
+
+    # ---- Scenario 17: idle but with a cached payload does NOT park.
+    p17 = ca.CaptchaPool()
+    p17._last_active = time.time() - (ca._IDLE_PAUSE_S + 60.0)
+    p17._last_gen = time.time() - 100.0
+    p17._generating = 0
+    p17._params = [(time.time(), "cached")]
+    spawn = p17._should_generate(time.time())
+    check("S17 idle with cached payload keeps pool active",
+          spawn is True and p17._active is True,
+          f"spawn={spawn} active={p17._active}")
+    assert spawn is True, "S17 regression"
+
+    # ---- Scenario 18: start() marks the pool active on demand.
+    p18 = ca.CaptchaPool()
+    p18._active = False
+    p18._last_active = time.time() - (ca._IDLE_PAUSE_S + 60.0)
+    p18.start()
+    check("S18 start() marks pool active",
+          p18._active is True and time.time() - p18._last_active < 2.0,
+          f"active={p18._active} last_active_delta={time.time() - p18._last_active:.2f}s")
+    assert p18._active is True, "S18 regression"
+
     print(f"\n{total - failures}/{total} scenarios passed")
     sys.exit(1 if failures else 0)
 

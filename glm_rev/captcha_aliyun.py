@@ -507,6 +507,11 @@ class CaptchaPool:
         self._started = False
 
     def start(self):
+        # Starting the pool is demand: wake it immediately instead of letting
+        # the idle gate park generation until the first get() arrives.
+        with self._lock:
+            self._last_active = time.time()
+            self._active = True
         if self._started:
             return
         self._started = True
@@ -518,6 +523,7 @@ class CaptchaPool:
         """Return a cached payload (fast), else None (caller falls back)."""
         with self._lock:
             self._last_active = time.time()
+            self._active = True
             now = time.time()
             valid = [p for p in self._params if now - p[0] < self.ttl]
             self._params = valid
@@ -527,30 +533,42 @@ class CaptchaPool:
                 return val
             return None
 
+    def _should_generate(self, now: float) -> bool:
+        """Return True if a background generator should spawn this tick.
+
+        Maintains the active/idle gate: an idle pool (no demand for
+        _IDLE_PAUSE_S) with no cached params parks generation entirely. Demand
+        (get/start) flips it back active, so warm serve during active use is
+        preserved while idle periods stop re-verifying flagged devices.
+        """
+        idle = now - self._last_active > _IDLE_PAUSE_S
+        if idle and not self._params:
+            self._active = False
+        else:
+            self._active = True
+        if not self._active:
+            return False
+        needed = self.max_params - len(self._params) - self._generating
+        if needed <= 0 or self._generating != 0:
+            return False
+        # Strictly one generator at a time: concurrent compute_final bursts
+        # against a flagged device amplify F001.
+        paced = (now - self._last_gen) >= (
+            _MIN_GEN_INTERVAL_S + random.uniform(-1.5, 1.5))
+        backoff_clear = (now >= _FAIL_BACKOFF_UNTIL
+                         and now >= _F001_UNTIL)
+        return paced and backoff_clear
+
     def _run(self):
         while True:
             time.sleep(0.5)
             with self._lock:
                 now = time.time()
                 self._params = [p for p in self._params if now - p[0] < self.ttl]
-                idle = time.time() - self._last_active > _IDLE_PAUSE_S
-                if idle and not self._params:
-                    self._active = False
-                else:
-                    self._active = True
-                needed = self.max_params - len(self._params) - self._generating
-                # Strictly one generator at a time: concurrent compute_final
-                # bursts against a flagged device amplify F001.
-                paced = (time.time() - self._last_gen) >= (
-                    _MIN_GEN_INTERVAL_S + random.uniform(-1.5, 1.5))
-                backoff_clear = (time.time() >= _FAIL_BACKOFF_UNTIL
-                                 and time.time() >= _F001_UNTIL)
-                if needed > 0 and self._generating == 0 and paced and backoff_clear:
+                targets = 1 if self._should_generate(now) else 0
+                if targets:
                     self._generating += 1
                     self._last_gen = time.time()
-                    targets = 1
-                else:
-                    targets = 0
             for _ in range(targets):
                 threading.Thread(target=self._generate_one, daemon=True).start()
 
