@@ -11,9 +11,9 @@ import threading
 import time
 import uuid
 
-from .config import BASE, ENDPOINT, LOCAL_TOOL_NAMES, load_allowlist, save_allowlist
+from .config import BASE, ENDPOINT, HISTORY_LIMIT, LOCAL_TOOL_NAMES, load_allowlist, save_allowlist
 from .api import sign, user_id_from_token
-from .client import refresh_token, create_chat, build_features, stream_turn
+from .client import refresh_token, create_chat, build_features, stream_turn, fetch_reply_node
 from .solver import CaptchaSolver, solve_fresh, register_solver
 from .tools import send_with_tools
 from .mcp import MCPManager, load_mcp_config
@@ -251,15 +251,19 @@ def send_message(state, prompt, md, debug_sse=False, on_token=None):
 
     if state["chat_id"] is None:
         print("[*] creating conversation...", file=sys.stderr)
-        chat_id, _ = create_chat(token, prompt, model=state["model"], cookie=state["cookie"],
-                                 enable_thinking=state["enable_thinking"],
-                                 reasoning_effort=state["reasoning_effort"])
+        chat_id, seed_msg_id, *_ = create_chat(token, prompt, model=state["model"],
+                                               cookie=state["cookie"],
+                                               messages=list(state["history"]) + [{"role": "user", "content": prompt}],
+                                               enable_thinking=state["enable_thinking"],
+                                               reasoning_effort=state["reasoning_effort"])
         state["chat_id"] = chat_id
+        state["seed_msg_id"] = seed_msg_id
     else:
         chat_id = state["chat_id"]
 
     is_first = not state["history"]
-    current_user_msg_id = str(uuid.uuid4())
+    current_user_msg_id = (state.get("seed_msg_id") if is_first and state.get("seed_msg_id")
+                           else str(uuid.uuid4()))
     current_user_parent_id = None if is_first else state.get("last_assistant_id")
 
     sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
@@ -353,10 +357,17 @@ def send_message(state, prompt, md, debug_sse=False, on_token=None):
         return False, msg
     state["history"].append({"role": "user", "content": prompt})
     state["history"].append({"role": "assistant", "content": text})
-    if len(state["history"]) > 120:
-        state["history"] = state["history"][-120:]
+    if len(state["history"]) > HISTORY_LIMIT:
+        state["history"] = state["history"][-HISTORY_LIMIT:]
     state["last_assistant_id"] = new_id
     state["last_assistant_parent_id"] = new_parent
+    # The SSE stream usually omits the stored assistant node id for this turn.
+    # Follow-ups MUST be parented at the server-assigned reply node (POSTed
+    # /rewritten ids are DEAF — verified live 2026-08-16), so learn it via GET.
+    aid, _ = fetch_reply_node(token, chat_id, after_user_id=current_user_msg_id,
+                              cookie=state["cookie"])
+    if aid:
+        state["last_assistant_id"] = aid
     if usage:
         state["usage"]["prompts"] += 1
         state["usage"]["in"] += usage.get("prompt_tokens", 0)

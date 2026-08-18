@@ -70,6 +70,7 @@ def patch(calls, answers, solved=True):
     tools.create_chat = fake_create_chat
     tools.solve_fresh = fake_solve_fresh
     tools.stream_turn = fake_stream_turn
+    tools.fetch_reply_node = lambda *a, **k: (None, None)
 
 
 print("== BUG 1: no pre-create solve ==")
@@ -150,6 +151,7 @@ def fake_solve_fresh2(solver, state):
 
 tools.solve_fresh = fake_solve_fresh2
 tools.stream_turn = fake_stream_turn2
+tools.fetch_reply_node = lambda *a, **k: (None, None)
 state = base_state()
 ok, err = tools.send_with_tools(state, "hello", captcha_fn=fake_captcha_fn)
 check("captcha_fn path succeeds", ok is True and err is None)

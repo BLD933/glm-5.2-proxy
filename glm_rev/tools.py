@@ -15,11 +15,11 @@ import sys
 import uuid
 
 from .api import sign, headers, user_id_from_token
-from .client import refresh_token, create_chat, build_features, stream_turn
-from .config import (BASE, ENDPOINT, LOCAL_TOOL_NAMES, MAX_TOOL_ITERS, REFUSAL_RE,
-                     TOOL_CONTRACT, TOOL_HINT, TOOL_NUDGE, UA, domain_allowed,
-                     load_allowlist, path_allowed, safe_json, parse_tool_calls,
-                     save_allowlist, strip_tool_lines)
+from .client import refresh_token, create_chat, build_features, stream_turn, fetch_reply_node
+from .config import (BASE, ENDPOINT, HISTORY_LIMIT, LOCAL_TOOL_NAMES, MAX_TOOL_ITERS,
+                     REFUSAL_RE, TOOL_CONTRACT, TOOL_HINT, TOOL_NUDGE, UA,
+                     domain_allowed, load_allowlist, path_allowed, safe_json,
+                     parse_tool_calls, save_allowlist, strip_tool_lines)
 from .solver import solve_fresh
 from .render import ReasoningStream
 
@@ -235,7 +235,7 @@ def _commit_history(prior, is_first, mcp, prompt, text):
     answer = strip_tool_lines(text).strip()
     if answer:
         clean.append({"role": "assistant", "content": answer})
-    return clean[-120:]
+    return clean[-HISTORY_LIMIT:]
 
 
 def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=False,
@@ -243,15 +243,19 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
     """Prompt + tool loop adapted to glm-rev.
 
     Each tool-loop iteration requires a FRESH single-use captcha (solve_fresh,
-    or `captcha_fn` when supplied), and multi-turn threading follows the app's
-    request builder:
-      iteration 0 -> current_user_message_id = fresh uuid, parent = None
-      iteration k -> current_user_message_id = last assistant id, parent = its parent
-    The full conversation accumulates in state["history"] so later REPL turns
-    continue the same thread. Reasoning and tool activity print to stderr; the
-    final answer streams through `writer` (server) or `md` (REPL).
-    Returns (ok, error) and updates state: chat_id, last_assistant_id,
-    last_assistant_parent_id, history, usage, cookie."""
+    or `captcha_fn` when supplied).
+
+    Threading rule (verified live 2026-08-16 with a 3-arm probe on chat.z.ai):
+    the completions backend recalls prior context ONLY when the request is
+    parented at a server-assigned assistant node id it streamed itself; turns
+    anchored under POST /chats/<id>-rewritten ids come back deaf. The SSE
+    stream usually omits the stored reply node id, so after every streamed
+    turn we GET the chat graph and resolve the assistant child of the user
+    node we just sent (fetch_reply_node) — that id parents the next request.
+    Reasoning and tool activity print to stderr; the final answer streams
+    through `writer` (server) or `md` (REPL). Returns (ok, error) and updates
+    state: chat_id, last_assistant_id, last_assistant_parent_id, history,
+    usage, cookie."""
     token = refresh_token(state["token"])
     state["token"] = token
     solver = solver if solver is not None else state.get("solver")
@@ -259,15 +263,21 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
     chat_id = state["chat_id"]
     is_first = chat_id is None
     seed_msg_id = None
+    seed_parent_id = None
     if is_first:
         print(f"{ANSI['dim']}[*] creating conversation...{ANSI['reset']}", file=sys.stderr)
         seed_msgs = list(state["history"]) + [{"role": "user", "content": prompt}]
-        chat_id, seed_msg_id = create_chat(token, prompt, model=state["model"],
-                                           cookie=state["cookie"],
-                                           messages=seed_msgs,
-                                           enable_thinking=state["enable_thinking"],
-                                           reasoning_effort=state["reasoning_effort"])
+        chat_res = create_chat(token, prompt, model=state["model"],
+                               cookie=state["cookie"],
+                               messages=seed_msgs,
+                               enable_thinking=state["enable_thinking"],
+                               reasoning_effort=state["reasoning_effort"])
+        chat_id = chat_res[0]
+        seed_msg_id = chat_res[1]
+        seed_parent_id = chat_res[2] if len(chat_res) > 2 else None
         state["chat_id"] = chat_id
+        state["seed_msg_id"] = seed_msg_id
+        state["seed_parent_id"] = seed_parent_id
 
     hist = list(state["history"])
     prior = list(state["history"])
@@ -291,8 +301,14 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
         captcha, cookie = fresh
         state["cookie"] = cookie
 
-        new_user_msg_id = seed_msg_id if (first and seed_msg_id) else str(uuid.uuid4())
-        parent_msg_id = None if first else last_ast_id
+        if first:
+            new_user_msg_id = (seed_msg_id if (first and seed_msg_id)
+                               else str(uuid.uuid4()))
+            parent_msg_id = (seed_parent_id if (first and seed_parent_id)
+                             else (None if first else last_ast_id))
+        else:
+            new_user_msg_id = str(uuid.uuid4())
+            parent_msg_id = last_ast_id
 
         rstream = ReasoningStream()
         fired = {"token": False}
@@ -344,6 +360,20 @@ def send_with_tools(state, prompt, md=None, mcp=None, solver=None, debug_sse=Fal
             for ln in reasoning.splitlines():
                 print(f"{ANSI['dim']}{ln}{ANSI['reset']}", file=sys.stderr)
             print(f"{ANSI['dim']}{'─' * 14}{ANSI['reset']}", file=sys.stderr)
+
+        # Discover the server-assigned reply node id: the completions backend
+        # only recalls context for turns parented at a node id it streamed
+        # itself (verified live 2026-08-16, 3-arm probe), and the SSE stream
+        # omits that stored id. GET the graph and resolve the assistant child
+        # of the user node just sent; it is the authoritative parent for the
+        # NEXT request. Fall back to the SSE id, then keep the prior anchor.
+        aid, _par = fetch_reply_node(token, chat_id,
+                                     after_user_id=new_user_msg_id,
+                                     cookie=state.get("cookie"))
+        if aid:
+            last_ast_id = aid
+        elif res.get("id"):
+            last_ast_id = res["id"]
 
         return True, (res, (res.get("answer") or "").strip())
 

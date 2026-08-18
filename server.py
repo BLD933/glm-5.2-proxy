@@ -15,8 +15,9 @@ from pydantic import BaseModel
 from typing import List, Optional, Union
 
 from glm_rev.solver import steal_captcha, CaptchaSolver, register_solver
-from glm_rev.client import create_chat, refresh_token, build_features
-from glm_rev.config import BASE, ENDPOINT, parse_tool_calls, strip_tool_lines
+from glm_rev.client import create_chat, refresh_token, build_features, stream_turn, fetch_reply_node
+from glm_rev.config import (BASE, ENDPOINT, parse_tool_calls, strip_tool_lines,
+                            REFUSAL_RE, TOOL_NUDGE_CLIENT, _intent_of)
 from glm_rev.api import sign, headers, user_id_from_token
 from glm_rev.tools import send_with_tools
 from glm_rev.mcp import MCPManager, load_mcp_config
@@ -62,6 +63,7 @@ _mcp_lock = threading.Lock()
 # Multi-turn sessions for /api/chat
 SESSIONS = {}
 MAX_HISTORY = 60
+HISTORY_LIMIT = 120
 
 
 def get_token() -> str:
@@ -176,6 +178,60 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
     stream_options: Optional[dict] = None
+    session_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    user: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+def _resolve_session_id(req: ChatCompletionRequest, request: Request) -> str:
+    """Resolve session/conversation ID from request body, headers, or client host."""
+    if getattr(req, "session_id", None):
+        return str(req.session_id)
+    if getattr(req, "conversation_id", None):
+        return str(req.conversation_id)
+    if getattr(req, "user", None):
+        return str(req.user)
+    for h in ("x-session-id", "x-conversation-id", "conversation_id", "session_id"):
+        val = request.headers.get(h)
+        if val:
+            return val.strip()
+    host = request.client.host if (request and request.client) else "default"
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return f"v1_sess_{uuid.uuid4().hex[:16]}"
+    return f"v1_sess_{host}"
+
+
+def _commit_turn(session_id: str, prompt_text: str, answer_text: str, chat_id: str = None, last_ast_id: str = None):
+    """Commit a completed conversational turn into the session cache."""
+    if not session_id or not prompt_text:
+        return
+    sess = SESSIONS.setdefault(session_id, {"history": [], "chat_id": None, "last_assistant_id": None})
+    hist = sess.setdefault("history", [])
+    hist.append({"role": "user", "content": prompt_text})
+    if answer_text:
+        hist.append({"role": "assistant", "content": answer_text})
+    if chat_id:
+        sess["chat_id"] = chat_id
+    if last_ast_id:
+        sess["last_assistant_id"] = last_ast_id
+    if len(hist) > HISTORY_LIMIT:
+        sess["history"] = hist[-HISTORY_LIMIT:]
+
+
+async def _fetch_reply(token, chat_id, cookie, after_user_id):
+    """Resolve the server-assigned assistant reply node for the last streamed
+    turn (GET /api/v1/chats/<id>, no captcha).
+
+    Verified live 2026-08-16: chat.z.ai's completions backend recalls prior
+    context ONLY when a request is parented at an assistant node id it
+    streamed itself — POST /chats/<id>-rewritten ids are DEAF, and the SSE
+    stream usually omits the stored reply id. Returns (assistant_id, None) or
+    (None, None)."""
+    return await asyncio.to_thread(fetch_reply_node, token, chat_id,
+                                   after_user_id=after_user_id, cookie=cookie)
 
 
 class ChatRequest(BaseModel):
@@ -300,13 +356,52 @@ class _CaptureWriter:
         return "".join(self.parts)
 
 
+def _assistant_tool_lines(m: Message) -> str:
+    lines = []
+    content = m.content
+    if isinstance(content, list):
+        content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+    if content:
+        lines.append(content)
+    for tc in m.tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = (fn.get("name") if isinstance(fn, dict) else None) or tc.get("name") or "?"
+        args = fn.get("arguments") if isinstance(fn, dict) else None
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        lines.append(f"TOOL:{name}({json.dumps(args or {}, ensure_ascii=False)})")
+    return "\n".join(lines)
+
+
+def _collect_directives(req: ChatCompletionRequest) -> str:
+    parts = []
+    for m in req.messages:
+        if m.role not in ("system", "developer"):
+            continue
+        content = m.content
+        if isinstance(content, list):
+            content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+        if content:
+            parts.append(content)
+    return "\n\n".join(parts)
+
+
 def _tool_messages(req: ChatCompletionRequest) -> list:
     """Sanitize OpenAI messages into GLM user/assistant {role, content} dicts.
 
     list-content (multimodal) is joined by text parts, role "tool" results are
-    wrapped as user messages ("[Tool result for <id>]: ..."), and role "system"
-    is dropped (GLM has no system role; the contract covers that duty)."""
+    wrapped as user messages ("[Tool result for <id>]: ..."), and system/developer
+    directives are collected and merged as a leading user message (GLM has no
+    system role)."""
     out = []
+    directives = _collect_directives(req)
+    if directives:
+        out.append({"role": "user", "content": directives})
     for m in req.messages:
         content = m.content
         if isinstance(content, list):
@@ -314,21 +409,37 @@ def _tool_messages(req: ChatCompletionRequest) -> list:
         if m.role == "tool":
             tid = m.tool_call_id or m.name or "?"
             out.append({"role": "user", "content": f"[Tool result for {tid}]: {content}"})
-        elif m.role in ("user", "assistant"):
-            out.append({"role": m.role, "content": content or ""})
+        elif m.role == "user":
+            out.append({"role": "user", "content": content or ""})
+        elif m.role == "assistant":
+            if m.tool_calls:
+                out.append({"role": "assistant", "content": _assistant_tool_lines(m)})
+            else:
+                out.append({"role": "assistant", "content": content or ""})
     return out
 
 
-def _tool_state(req: ChatCompletionRequest, token: str) -> dict:
+def _tool_state(req: ChatCompletionRequest, token: str, session_id: str = None) -> dict:
     msgs = _tool_messages(req)
     last_user = -1
-    sanitized = 0
-    for m in req.messages:
-        if m.role == "user":
-            last_user = sanitized
-        if m.role in ("user", "assistant", "tool"):
-            sanitized += 1
+    for idx, mm in enumerate(msgs):
+        if mm["role"] == "user":
+            last_user = idx
     history = msgs[:last_user] if last_user >= 0 else []
+    if session_id and len(req.messages) == 1 and not history:
+        sess = SESSIONS.get(session_id)
+        if sess and sess.get("history"):
+            history = list(sess["history"])
+    chat_id = None
+    last_assistant_id = None
+    last_assistant_parent_id = None
+    seed_msg_id = None
+    if session_id:
+        sess = SESSIONS.get(session_id) or {}
+        chat_id = sess.get("chat_id")
+        last_assistant_id = sess.get("last_assistant_id")
+        last_assistant_parent_id = sess.get("last_assistant_parent_id")
+        seed_msg_id = sess.get("seed_msg_id")
     return {
         "token": token,
         "cookie": None,
@@ -338,9 +449,10 @@ def _tool_state(req: ChatCompletionRequest, token: str) -> dict:
         "web_search": req.web_search,
         "temperature": req.temperature if req.temperature is not None else 1.0,
         "max_tokens": req.max_tokens if req.max_tokens is not None else 8192,
-        "chat_id": None,
-        "last_assistant_id": None,
-        "last_assistant_parent_id": None,
+        "chat_id": chat_id,
+        "last_assistant_id": last_assistant_id,
+        "last_assistant_parent_id": last_assistant_parent_id,
+        "seed_msg_id": seed_msg_id,
         "history": history,
         "usage": {"prompts": 0, "in": 0, "out": 0},
         "solver": None,
@@ -364,7 +476,7 @@ def _tool_prompt(req: ChatCompletionRequest) -> str:
     return prompt
 
 
-async def _run_with_tools(req: ChatCompletionRequest, token: str):
+async def _run_with_tools(req: ChatCompletionRequest, token: str, request: Request = None):
     """Execute the real tool loop (local + MCP) for an OpenAI tools request.
 
     Runs send_with_tools on a worker thread (it blocks on captcha solves and
@@ -374,7 +486,8 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
     prompt = _tool_prompt(req)
     if not prompt:
         raise HTTPException(status_code=400, detail="No user message")
-    state = _tool_state(req, token)
+    session_id = _resolve_session_id(req, request) if request else None
+    state = _tool_state(req, token, session_id=session_id)
     mcp = _get_mcp()
     captcha_fn = lambda: _captcha_pair(token)
     completion_id = f"chatcmpl-{uuid.uuid4()}"
@@ -406,6 +519,18 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
                     state, prompt, mcp=mcp, auto_approve=True, writer=writer,
                     captcha_fn=captcha_fn)
             finally:
+                if session_id:
+                    s = SESSIONS.setdefault(session_id, {})
+                    if state.get("history"):
+                        s["history"] = list(state["history"])
+                    if state.get("chat_id"):
+                        s["chat_id"] = state["chat_id"]
+                    if state.get("last_assistant_id"):
+                        s["last_assistant_id"] = state["last_assistant_id"]
+                    if state.get("last_assistant_parent_id"):
+                        s["last_assistant_parent_id"] = state["last_assistant_parent_id"]
+                    if state.get("seed_msg_id"):
+                        s["seed_msg_id"] = state["seed_msg_id"]
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
         loop.run_in_executor(None, run)
@@ -433,6 +558,18 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
     ok, err = await asyncio.to_thread(
         send_with_tools, state, prompt, mcp=mcp, auto_approve=True,
         writer=writer, captcha_fn=captcha_fn)
+    if session_id:
+        s = SESSIONS.setdefault(session_id, {})
+        if state.get("history"):
+            s["history"] = list(state["history"])
+        if state.get("chat_id"):
+            s["chat_id"] = state["chat_id"]
+        if state.get("last_assistant_id"):
+            s["last_assistant_id"] = state["last_assistant_id"]
+        if state.get("last_assistant_parent_id"):
+            s["last_assistant_parent_id"] = state["last_assistant_parent_id"]
+        if state.get("seed_msg_id"):
+            s["seed_msg_id"] = state["seed_msg_id"]
     if not ok and not writer.text:
         raise HTTPException(status_code=502, detail=err or "tool loop failed")
     return {
@@ -453,29 +590,177 @@ async def _run_with_tools(req: ChatCompletionRequest, token: str):
     }
 
 
-def _tools_contract(tools) -> str:
-    """Render the client's tool schemas into a TOOL:-line text contract."""
-    lines = [
-        "You are a coding agent. To invoke a tool, emit exactly one line:",
-        "  TOOL:<name>({\"arg\": \"value\", ...})",
-        "Then the caller executes it and returns the result as a [Tool result] message.",
-        "Continue emitting TOOL: lines until you have all data, then give your final answer.",
-        "Available tools:",
-    ]
-    for i, t in enumerate(tools or []):
+# Curated, GLM-friendly core tools. GLM-5.2 emits these names reliably (the
+# same set the --repl uses via TOOL_CONTRACT); parse_tool_calls maps them back
+# to the client's real tool names via INTENT_TO_CLIENT_TOOL / _INTENT_CLUSTERS.
+_TOOL_DISPLAY = {
+    "exec":   ("run_command", '{"cmd": "ls -la"}'),
+    "list":   ("list_dir",    '{"path": "."}'),
+    "read":   ("read_file",   '{"path": "/etc/hostname"}'),
+    "write":  ("write_file",  '{"path": "file.txt", "content": "hello"}'),
+    "search": ("grep",        '{"pattern": "TODO", "path": "."}'),
+}
+_CORE_INTENT_ORDER = ["exec", "list", "read", "write", "search", "edit"]
+
+
+def _intent_display(intent):
+    """(GLM-friendly name, example args) for a contracted intent; edit is
+    special-cased since it keeps its real OpenAI name/args."""
+    if intent == "edit":
+        return "edit", '{"old_string": "foo", "new_string": "bar"}'
+    return _TOOL_DISPLAY[intent]
+
+
+def _tool_hint_client(contracted_tools):
+    """Per-prompt TOOL_HINT for the client path (repl appends TOOL_HINT to every
+    turn; without it GLM drifts to web native formats. Keep it SMALL and
+    reference ONLY the curated names actually offered, to avoid confusing GLM
+    with tools that aren't in this conversation)."""
+    contracted = contracted_tools or set()
+    lines = [f"  TOOL:{_intent_display(intent)[0]}({_intent_display(intent)[1]})\n"
+             for intent in _CORE_INTENT_ORDER if intent in contracted]
+    if contracted:
+        first = next((i for i in _CORE_INTENT_ORDER if i in contracted), None)
+        name, ex = _intent_display(first)
+        example = f"TOOL:{name}({ex})"
+    else:
+        example = 'TOOL:run_command({"cmd": "ls -la"})'
+    return (
+        "\n(Reminder: emit TOOL: lines across iterations for multi-step tasks; never "
+        "repeat identical calls. Available tools — one per line, nothing else:\n"
+        + "".join(lines)
+        + "When all info gathered, write your final answer. Example: "
+        + example
+        + ")"
+    )
+
+
+def _contracted_intents(tools):
+    """Which curated intents the client tool set contracts (mirrors the
+    detection loop in _tools_contract)."""
+    intents = set()
+    for t in tools or []:
         if not isinstance(t, dict):
             continue
         fn = t.get("function", t) or {}
-        name = fn.get("name") or t.get("name") or f"tool_{i}"
-        desc = (fn.get("description") or t.get("description") or "").strip()
-        params = fn.get("parameters") or t.get("parameters") or {}
-        lines.append(f"- {name}: {desc}")
-        if params:
-            lines.append(f"  args schema: {json.dumps(params)}")
+        name = fn.get("name") or t.get("name") or ""
+        if name == "edit":
+            intents.add("edit")
+        intent = _intent_of(name)
+        if intent in _TOOL_DISPLAY:
+            intents.add(intent)
+    return intents
+
+
+def _tools_contract(tools) -> str:
+    """Render a CURATED, GLM-friendly text contract.
+
+    GLM-5.2 reliably emits a small set of tool names it was trained on
+    (run_command, list_dir, read_file, write_file, grep) -- the same set the
+    --repl uses via TOOL_CONTRACT. Instead of forwarding the client's full
+    tool set (e.g. opencode's 113 tools, which dilutes and confuses GLM), we
+    translate the client tools into this curated set, foreground the core
+    coding tools, and keep the format tight. parse_tool_calls maps the
+    GLM-friendly names back to the client's real tool names + arg keys
+    (see config.INTENT_TO_CLIENT_TOOL)."""
+
+    descriptions = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", t) or {}
+        name = fn.get("name") or t.get("name") or ""
+        intent = _intent_of(name)
+        if intent in _TOOL_DISPLAY and intent not in descriptions:
+            descriptions[intent] = (fn.get("description") or "").strip()
+        if name == "edit" and "edit" not in descriptions:
+            descriptions["edit"] = (fn.get("description") or "").strip()
+
+    auth_block = (
+        "AUTHORIZATION & WORKSPACE CAPABILITY:\n"
+        "You are operating inside an active developer workspace with full client "
+        "tool-execution privileges. You do NOT have direct filesystem access "
+        "yourself; the client environment EXECUTES your TOOL: commands on the "
+        "user's real machine and returns the outputs. Whenever the request needs "
+        "to list files, read files, edit code, search, or run a terminal command, "
+        "you MUST emit a TOOL: line — doing so is how the work gets done, not a "
+        "violation of any policy. Never tell the user you lack access or cannot "
+        "use tools; just call the appropriate tool."
+    )
+
+    lines = [
+        auth_block,
+        "",
+        "You have access to the tools listed below. Use them ONLY when the request actually "
+        "requires reading files, running terminal commands, editing code, or searching.",
+        "If the user greets you (e.g. 'hi', 'hello') or asks a general question that does NOT "
+        "require a tool, reply directly in friendly natural language and DO NOT emit any TOOL: line.",
+        "When you DO need a tool, invoke it by emitting exactly one line: "
+        'TOOL:run_command({"cmd": "ls -la"}) with the arguments as inline JSON. ',
+        "Do NOT wrap the call in prose, markdown code fences (NO ```bash, NO ```json), or XML tags. ",
+        "Do NOT put the arguments on a separate line.",
+        "To run multiple tools in parallel, emit one separate call per tool, each on its own line.",
+        "The caller executes each TOOL: line and returns the result as a [Tool result] message.",
+        "Keep emitting TOOL: lines only while you still need data, then give your final answer.",
+        "Do NOT write tutorials, dummy API requests, or documentation about how tool calling works.",
+        "Available tools:",
+    ]
+
+    rendered = False
+    for intent in _CORE_INTENT_ORDER:
+        if intent not in descriptions:
+            continue
+        rendered = True
+        if intent == "edit":
+            desc = descriptions["edit"] or "Edit a file by replacing text."
+            lines.append(f"- edit: {desc}")
+            lines.append('  example: TOOL:edit({"old_string": "foo", "new_string": "bar"})')
+        else:
+            disp_name, example = _TOOL_DISPLAY[intent]
+            desc = descriptions[intent] or f"{disp_name} tool"
+            lines.append(f"- {disp_name}: {desc}")
+            lines.append(f"  example: TOOL:{disp_name}({example})")
+    if not rendered:
+        for t in (tools or [])[:8]:
+            fn = (t.get("function", t) if isinstance(t, dict) else {}) or {}
+            name = fn.get("name") or (t.get("name") if isinstance(t, dict) else "") or "tool"
+            lines.append(f"- {name}: {(fn.get('description') or '').strip()}")
     return "\n".join(lines)
 
 
-async def _run_client_tools(req: ChatCompletionRequest, token: str):
+async def _client_nudge(answer, formatted_messages, *, token, cookie, chat_id, model,
+                        msg_id, features, params, captcha, req, call_upstream,
+                        max_nudges=2):
+    """Refusal recovery for the client-side tool path.
+
+    If `answer` already contains a tool call, return it unchanged. If `answer`
+    matches the refusal regex but has no call, transparently nudge GLM (up to
+    `max_nudges` times) via `call_upstream(messages, nudge_text)` (one upstream
+    turn, returns answer text) and return any parsed call. OpenCode never sees
+    the refusal text."""
+    calls = parse_tool_calls(answer, known_tools=req.tools)
+    if calls:
+        return calls, answer
+    messages = list(formatted_messages)
+    attempts = 0
+    while REFUSAL_RE.search(answer) and attempts < max_nudges:
+        messages = messages + [
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": TOOL_NUDGE_CLIENT},
+        ]
+        try:
+            retry_text = await call_upstream(messages, TOOL_NUDGE_CLIENT)
+        except Exception:
+            return [], answer
+        retry_calls = parse_tool_calls(retry_text, known_tools=req.tools)
+        if retry_calls:
+            return retry_calls, retry_text
+        answer = retry_text
+        attempts += 1
+    return [], answer
+
+
+async def _run_client_tools(req: ChatCompletionRequest, token: str, request: Request = None):
     """OpenAI-compatible client-side tool calling.
 
     Builds a TOOL:-line contract from the client's tool schemas, sends it to
@@ -489,35 +774,84 @@ async def _run_client_tools(req: ChatCompletionRequest, token: str):
     if not req.messages:
         raise HTTPException(status_code=400, detail="No messages")
 
+    session_id = _resolve_session_id(req, request) if request else None
+    sess_history = []
+    if session_id:
+        if len(req.messages) == 1:
+            sess_history = list(SESSIONS.get(session_id, {}).get("history", []))
+        else:
+            hist = _tool_messages(req)[:-1]
+            if len(hist) > HISTORY_LIMIT:
+                hist = hist[-HISTORY_LIMIT:]
+            SESSIONS.setdefault(session_id, {})["history"] = hist
+
     contract = _tools_contract(req.tools)
+    directives = _collect_directives(req)
+    lead = f"{directives}\n\n{contract}" if directives else contract
     formatted_messages = []
+    for m in sess_history:
+        formatted_messages.append({"role": m["role"], "content": m["content"]})
+
+    def _has_contract():
+        for fm in formatted_messages:
+            if fm["role"] == "user" and contract in fm["content"]:
+                return True
+        return False
+
     for i, m in enumerate(req.messages):
         content = m.content
         if isinstance(content, list):
             content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
         role = m.role
         if role == "user":
-            if i == len(req.messages) - 1:
-                content = f"{contract}\n\n{content}"
+            if i == 0 and not _has_contract():
+                content = f"{lead}\n\n{content}"
             formatted_messages.append({"role": "user", "content": content})
         elif role == "assistant":
-            formatted_messages.append({"role": "assistant", "content": content or ""})
+            if m.tool_calls:
+                formatted_messages.append({"role": "assistant", "content": _assistant_tool_lines(m)})
+            else:
+                formatted_messages.append({"role": "assistant", "content": content or ""})
         elif role == "tool":
             tid = m.tool_call_id or m.name or "?"
             formatted_messages.append({"role": "user",
                                        "content": f"[Tool result for {tid}]: {content}"})
+    if req.messages and req.messages[0].role != "user" and not _has_contract():
+        formatted_messages.insert(0, {"role": "user", "content": lead})
+
+    # Repl parity: every turn's prompt carries the TOOL_HINT reminder; without it
+    # GLM-5.2 drifts to the chat.z.ai web app's native tool formats instead of
+    # the TOOL: convention. Append to the LAST message (the one GLM answers).
+    if formatted_messages:
+        hint = _tool_hint_client(_contracted_intents(req.tools))
+        formatted_messages[-1]["content"] = formatted_messages[-1]["content"] + hint
     prompt = formatted_messages[-1]["content"]
 
     chat_model = MODEL_ALIASES.get(req.model or "glm-5.2", req.model or "glm-5.2")
     captcha, cookie = await acquire_captcha(token)
-    chat_id, msg_id = create_chat(token, prompt, model=chat_model, cookie=cookie,
-                                  messages=_tool_messages(req),
-                                  enable_thinking=req.enable_thinking,
-                                  reasoning_effort=req.reasoning_effort)
+    sess = SESSIONS.get(session_id) if session_id else None
+    if sess and sess.get("chat_id"):
+        chat_id = sess["chat_id"]
+        msg_id = str(uuid.uuid4())
+        parent_msg_id = sess.get("last_assistant_id") or sess.get("seed_msg_id")
+    else:
+        seed_messages = list(sess_history) + _tool_messages(req)
+        chat_res = create_chat(token, prompt, model=chat_model, cookie=cookie,
+                               messages=seed_messages,
+                               enable_thinking=req.enable_thinking,
+                               reasoning_effort=req.reasoning_effort)
+        chat_id = chat_res[0]
+        msg_id = chat_res[1]
+        parent_msg_id = chat_res[2] if len(chat_res) > 2 else None
+        if session_id:
+            s = SESSIONS.setdefault(session_id, {})
+            s["chat_id"] = chat_id
+            s["seed_msg_id"] = msg_id
     sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
                                current_url=f"{BASE}/c/{chat_id}")
     url = f"{BASE}{ENDPOINT}?{url_params}&signature_timestamp={ts}"
     params = {"max_tokens": req.max_tokens, "temperature": req.temperature, "top_p": 0.95}
+    features = build_features(req.enable_thinking, req.reasoning_effort, req.web_search)
 
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created = int(time.time())
@@ -538,16 +872,17 @@ async def _run_client_tools(req: ChatCompletionRequest, token: str):
             "choices": [{"index": 0, "delta": d, "finish_reason": finish_reason}],
         }
 
-    reasoning_buf, text_buf = [], []
-    for line in requests.post(
+    usage = None
+    last_ast_id = None
+    resp = requests.post(
         url, headers=headers(token, sig, cookie), stream=True, timeout=120,
         json={
             "background_tasks": {"title_generation": True, "tags_generation": True},
             "chat_id": chat_id,
             "current_user_message_id": msg_id,
-            "current_user_message_parent_id": None,
+            "current_user_message_parent_id": parent_msg_id,
             "extra": {},
-            "features": build_features(req.enable_thinking, req.reasoning_effort, req.web_search),
+            "features": features,
             "id": str(uuid.uuid4()),
             "messages": formatted_messages,
             "model": chat_model,
@@ -557,75 +892,183 @@ async def _run_client_tools(req: ChatCompletionRequest, token: str):
             "variables": {},
             "captcha_verify_param": captcha,
         },
-    ).iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if data == "[DONE]":
-            break
-        try:
-            inner = json.loads(data).get("data", {})
-        except Exception:
-            continue
-        delta = inner.get("delta_content") or ""
-        if not delta:
-            continue
-        if inner.get("phase") == "thinking":
-            reasoning_buf.append(delta)
-        else:
-            text_buf.append(delta)
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:1000])
 
-    full_text = "".join(text_buf)
-    reasoning = "".join(reasoning_buf)
-    calls = parse_tool_calls(full_text)
+    def _reasoning_chunk(text):
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": chat_model,
+            "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
+        }
 
-    if calls:
-        tool_calls = [{
-            "index": i,
-            "id": f"call_{i}",
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args or {}, ensure_ascii=False)},
-        } for i, (name, args, _matched) in enumerate(calls)]
-
-        if req.stream:
-            async def gen():
-                yield f"data: {json.dumps(chunk(tool_calls=tool_calls, delta=None, role='assistant'))}\n\n"
-                yield f"data: {json.dumps(chunk(finish_reason='tool_calls'))}\n\n"
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(gen(), media_type="text/event-stream")
+    # ---- Non-streaming path: buffer the whole upstream then emit once. ----
+    if not req.stream:
+        reasoning_buf, text_buf = [], []
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                inner = json.loads(data).get("data", {})
+            except Exception:
+                continue
+            if inner.get("id"):
+                last_ast_id = inner["id"]
+            if inner.get("usage"):
+                usage = inner["usage"]
+            delta = inner.get("delta_content") or ""
+            if not delta:
+                continue
+            if inner.get("phase") == "thinking":
+                reasoning_buf.append(delta)
+            else:
+                text_buf.append(delta)
+        if session_id and last_ast_id:
+            SESSIONS.setdefault(session_id, {})["last_assistant_id"] = last_ast_id
+        full_text = "".join(text_buf)
+        reasoning = "".join(reasoning_buf)
+        calls = parse_tool_calls(full_text, known_tools=req.tools)
+        if calls:
+            aid2, _ = await _fetch_reply(token, chat_id, cookie, after_user_id=msg_id)
+            if session_id and aid2:
+                SESSIONS.setdefault(session_id, {})["last_assistant_id"] = aid2
+            tool_calls = [{
+                "index": i,
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args or {}, ensure_ascii=False)},
+            } for i, (name, args, _matched) in enumerate(calls)]
+            message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            r = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": chat_model,
+                "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+            }
+            if usage:
+                norm = normalize_usage(usage)
+                if norm:
+                    r["usage"] = norm
+            return r
+        answer = strip_tool_lines(full_text)
+        raw_user_prompt = _tool_prompt(req)
+        if session_id:
+            _commit_turn(session_id, raw_user_prompt, answer, chat_id=chat_id)
+            aid2, _ = await _fetch_reply(token, chat_id, cookie, after_user_id=msg_id)
+            if aid2:
+                SESSIONS.setdefault(session_id, {})["last_assistant_id"] = aid2
+        message = {"role": "assistant", "content": answer or None}
+        if reasoning:
+            message["reasoning_content"] = reasoning
         return {
             "id": completion_id,
             "object": "chat.completion",
             "created": created,
             "model": chat_model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
-                "finish_reason": "tool_calls",
-            }],
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         }
 
-    answer = strip_tool_lines(full_text)
-    message = {"role": "assistant", "content": answer or None}
-    if reasoning:
-        message["reasoning_content"] = reasoning
-    if req.stream:
-        async def gen():
-            yield f"data: {json.dumps(chunk_init(completion_id, created, chat_model))}\n\n"
-            if reasoning:
-                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': chat_model, 'choices': [{'index': 0, 'delta': {'reasoning_content': reasoning}, 'finish_reason': None}]})}\n\n"
-            if answer:
-                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': chat_model, 'choices': [{'index': 0, 'delta': {'content': answer}, 'finish_reason': None}]})}\n\n"
-            yield f"data: {json.dumps(chunk(finish_reason='stop'))}\n\n"
+    # ---- Streaming path: buffer the whole answer phase, then decide
+    # ---- tool-vs-content at end-of-stream (GLM emits prose before TOOL:). ----
+    async def gen():
+        yield f"data: {json.dumps(chunk_init(completion_id, created, chat_model))}\n\n"
+        answer_parts, reasoning_parts = [], []
+        _usage, _last = None, None
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                inner = json.loads(data).get("data", {})
+            except Exception:
+                continue
+            if inner.get("id"):
+                _last = inner["id"]
+            if inner.get("usage"):
+                _usage = inner["usage"]
+            delta = inner.get("delta_content") or ""
+            if not delta:
+                continue
+            if inner.get("phase") == "thinking":
+                reasoning_parts.append(delta)
+                yield f"data: {json.dumps(_reasoning_chunk(delta))}\n\n"
+                continue
+            answer_parts.append(delta)
+
+        if session_id and _last:
+            SESSIONS.setdefault(session_id, {})["last_assistant_id"] = _last
+
+        answer = "".join(answer_parts)
+
+        async def _call_upstream(messages, nudge_text):
+            sig2, up2, ts2 = sign(nudge_text, user_id_from_token(token), token,
+                                  current_url=f"{BASE}/c/{chat_id}")
+            url2 = f"{BASE}{ENDPOINT}?{up2}&signature_timestamp={ts2}"
+            res = await asyncio.to_thread(
+                stream_turn,
+                token=token, cookie=cookie, sig=sig2, url=url2, chat_id=chat_id,
+                model=chat_model, messages=messages,
+                current_user_message_id=str(uuid.uuid4()),
+                current_user_message_parent_id=msg_id,
+                is_first=False, features=features, params=params, captcha=captcha,
+                signature_prompt_override=nudge_text,
+            )
+            ans = res.get("answer") or ""
+            return ans
+
+        calls, answer = await _client_nudge(
+            answer, formatted_messages, token=token, cookie=cookie, chat_id=chat_id,
+            model=chat_model, msg_id=msg_id, features=features, params=params,
+            captcha=captcha, req=req, call_upstream=_call_upstream)
+
+        # Discover the server-assigned reply node id (SSE omits it). The next
+        # request MUST be parented beneath it or the completions backend
+        # answers without any prior context (verified live 2026-08-16).
+        aid2, _ = await _fetch_reply(token, chat_id, cookie, after_user_id=msg_id)
+        if session_id and aid2:
+            SESSIONS.setdefault(session_id, {})["last_assistant_id"] = aid2
+
+        if calls:
+            tool_calls = [{
+                "index": i,
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args or {}, ensure_ascii=False)},
+            } for i, (name, args, _matched) in enumerate(calls)]
+            yield f"data: {json.dumps(chunk(tool_calls=tool_calls, delta=None, role='assistant'))}\n\n"
+            finish = chunk(finish_reason="tool_calls")
+            norm = normalize_usage(_usage)
+            if norm:
+                finish["usage"] = norm
+            yield f"data: {json.dumps(finish)}\n\n"
             yield "data: [DONE]\n\n"
-        return StreamingResponse(gen(), media_type="text/event-stream")
-    return {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": chat_model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-    }
+            return
+
+        final_answer = answer
+        if session_id:
+            _commit_turn(session_id, _tool_prompt(req), final_answer, chat_id=chat_id)
+        if answer:
+            yield f"data: {json.dumps(chunk(delta=answer))}\n\n"
+        finish = chunk(finish_reason="stop")
+        norm = normalize_usage(_usage)
+        if norm:
+            finish["usage"] = norm
+        yield f"data: {json.dumps(finish)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/v1/chat/completions")
@@ -635,24 +1078,48 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         token = refresh_token(token)
 
         if req.tools:
-            if os.environ.get("GLM_CLIENT_TOOLS") in ("1", "true", "yes"):
-                return await _run_client_tools(req, token)
-            return await _run_with_tools(req, token)
+            if os.environ.get("GLM_SERVER_TOOLS") in ("1", "true", "yes"):
+                return await _run_with_tools(req, token, request=request)
+            return await _run_client_tools(req, token, request=request)
 
+        session_id = _resolve_session_id(req, request)
+        sess_history = []
+        if session_id:
+            if len(req.messages) == 1:
+                sess_history = list(SESSIONS.get(session_id, {}).get("history", []))
+            else:
+                hist = _tool_messages(req)[:-1]
+                if len(hist) > HISTORY_LIMIT:
+                    hist = hist[-HISTORY_LIMIT:]
+                SESSIONS.setdefault(session_id, {})["history"] = hist
+
+        directives = _collect_directives(req)
         formatted_messages = []
+        for m in sess_history:
+            formatted_messages.append({"role": m["role"], "content": m["content"]})
+
         prompt = ""
         for i, m in enumerate(req.messages):
             role = m.role
             content = m.content
             if isinstance(content, list):
                 content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+            if role in ("system", "developer"):
+                continue
             if role == "user":
                 formatted_messages.append({"role": "user", "content": content})
                 prompt = content
             elif role == "assistant":
-                formatted_messages.append({"role": "assistant", "content": content})
+                if m.tool_calls:
+                    formatted_messages.append({"role": "assistant", "content": _assistant_tool_lines(m)})
+                else:
+                    formatted_messages.append({"role": "assistant", "content": content})
             elif role == "tool":
                 formatted_messages.append({"role": "user", "content": f"[Tool Result]: {content}"})
+        if directives:
+            leading = [fm for fm in formatted_messages if fm["role"] == "user"]
+            if not leading or directives not in leading[0]["content"]:
+                formatted_messages.insert(0, {"role": "user", "content": directives})
 
         captcha, cookie = await acquire_captcha(token)
 
@@ -661,19 +1128,36 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             chat_model = "glm-5.2"
         chat_model = MODEL_ALIASES.get(chat_model, chat_model)
 
-        chat_id, msg_id = create_chat(token, prompt, model=chat_model, cookie=cookie,
-                                      messages=_tool_messages(req),
-                                      enable_thinking=req.enable_thinking,
-                                      reasoning_effort=req.reasoning_effort)
+        sess = SESSIONS.get(session_id) if session_id else None
+        is_first = not (sess and sess.get("chat_id"))
+        if sess and sess.get("chat_id"):
+            chat_id = sess["chat_id"]
+            msg_id = str(uuid.uuid4())
+            parent_msg_id = sess.get("last_assistant_id") or sess.get("seed_msg_id")
+        else:
+            seed_messages = list(sess_history) + _tool_messages(req)
+            chat_res = create_chat(token, prompt, model=chat_model, cookie=cookie,
+                                   messages=seed_messages,
+                                   enable_thinking=req.enable_thinking,
+                                   reasoning_effort=req.reasoning_effort)
+            chat_id = chat_res[0]
+            msg_id = chat_res[1]
+            parent_msg_id = chat_res[2] if len(chat_res) > 2 else None
+            if session_id:
+                s = SESSIONS.setdefault(session_id, {})
+                s["chat_id"] = chat_id
+                s["seed_msg_id"] = msg_id
         sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
                                    current_url=f"{BASE}/c/{chat_id}")
         url = f"{BASE}{ENDPOINT}?{url_params}&signature_timestamp={ts}"
 
-        body = {
-            "background_tasks": {"title_generation": True, "tags_generation": True},
+        body = {}
+        if is_first:
+            body["background_tasks"] = {"title_generation": True, "tags_generation": True}
+        body.update({
             "chat_id": chat_id,
             "current_user_message_id": msg_id,
-            "current_user_message_parent_id": None,
+            "current_user_message_parent_id": parent_msg_id,
             "extra": {},
             "features": build_features(req.enable_thinking, req.reasoning_effort, req.web_search),
             "id": str(uuid.uuid4()),
@@ -681,10 +1165,30 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "model": chat_model,
             "params": {"max_tokens": req.max_tokens, "temperature": req.temperature, "top_p": 0.95},
             "signature_prompt": prompt,
-            "stream": req.stream,
+            "stream": True,
             "variables": {},
             "captcha_verify_param": captcha,
-        }
+        })
+
+        # ===== TEMP DEBUG INSTRUMENTATION (remove before shipping) =====
+        try:
+            _dbg = open("/tmp/glm_upstream_debug.log", "a")
+            _dbg.write("\n===== UPSTREAM REQUEST =====\n")
+            _dbg.write(f"url: {url}\n")
+            _dbg.write(f"chat_id: {chat_id}\n")
+            _dbg.write(f"current_user_message_id: {msg_id}\n")
+            _dbg.write(f"current_user_message_parent_id: {parent_msg_id}\n")
+            _dbg.write(f"signature_prompt: {prompt!r}\n")
+            _dbg.write("messages:\n")
+            for _fm in formatted_messages:
+                _dbg.write(f"  role={_fm.get('role')} content={_fm.get('content')!r}\n")
+            _dbg.write(f"session_id: {session_id}\n")
+            _dbg.write(f"sess_state: {dict(SESSIONS.get(session_id, {})) if session_id else None}\n")
+            _dbg.write("================================\n")
+            _dbg.close()
+        except Exception as _e:
+            print(f"DEBUGLOG-ERR {_e}", file=__import__('sys').stderr)
+        # ===== END TEMP DEBUG INSTRUMENTATION =====
 
         resp = requests.post(url, headers=headers(token, sig, cookie), json=body,
                              stream=True, timeout=120)
@@ -697,6 +1201,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             full_text = ""
             reasoning = ""
             usage = None
+            last_ast = None
             for line in resp.iter_lines(decode_unicode=True):
                 if not line or not line.startswith("data:"):
                     continue
@@ -706,8 +1211,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 try:
                     j = json.loads(data)
                     inner = j.get("data", {})
+                    try:
+                        _dbg = open("/tmp/glm_upstream_debug.log", "a")
+                        _dbg.write(f"[SSE-FULL] {json.dumps(j)[:800]}\n")
+                        _dbg.close()
+                    except Exception:
+                        pass
                     phase = inner.get("phase")
                     delta = inner.get("delta_content") or ""
+                    if inner.get("id"):
+                        last_ast = inner["id"]
                     if inner.get("usage"):
                         usage = inner.get("usage")
                     if phase == "thinking":
@@ -716,10 +1229,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         full_text += delta
                 except Exception:
                     pass
-            return full_text, reasoning, usage
+            return full_text, reasoning, usage, last_ast
 
         if not req.stream:
-            full_text, reasoning, usage = collect()
+            full_text, reasoning, usage, last_ast = collect()
+            if session_id:
+                _commit_turn(session_id, prompt, full_text, chat_id=chat_id, last_ast_id=last_ast)
+                aid2, _ = await _fetch_reply(token, chat_id, cookie, after_user_id=msg_id)
+                if aid2:
+                    SESSIONS.setdefault(session_id, {})["last_assistant_id"] = aid2
+            try:
+                _dbg = open("/tmp/glm_upstream_debug.log", "a")
+                _dbg.write(f"===== TURN1/COLLECT SSE last_ast (inner id): {last_ast!r}\n")
+                _dbg.close()
+            except Exception:
+                pass
             message = {"role": "assistant", "content": full_text or None}
             if reasoning:
                 message["reasoning_content"] = reasoning
@@ -741,6 +1265,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         async def event_generator():
             yield f"data: {json.dumps(chunk_init(completion_id, int(time.time()), chat_model))}\n\n"
             usage = None
+            last_ast = None
+            answer_buf = []
             for line in resp.iter_lines(decode_unicode=True):
                 if not line:
                     continue
@@ -751,6 +1277,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     try:
                         j = json.loads(data)
                         inner = j.get("data", {})
+                        if inner.get("id"):
+                            last_ast = inner["id"]
                         phase = inner.get("phase")
                         delta = inner.get("delta_content") or ""
                         if inner.get("usage"):
@@ -761,6 +1289,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             delta_key = "reasoning_content"
                         else:
                             delta_key = "content"
+                            answer_buf.append(delta)
                         chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -775,6 +1304,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         yield f"data: {json.dumps(chunk)}\n\n"
                     except Exception:
                         pass
+            if session_id:
+                _commit_turn(session_id, prompt, "".join(answer_buf), chat_id=chat_id, last_ast_id=last_ast)
+                aid2, _ = await _fetch_reply(token, chat_id, cookie, after_user_id=msg_id)
+                if aid2:
+                    SESSIONS.setdefault(session_id, {})["last_assistant_id"] = aid2
+            try:
+                _dbg = open("/tmp/glm_upstream_debug.log", "a")
+                _dbg.write(f"===== SSE last_ast (inner id): {last_ast!r}\n")
+                _dbg.close()
+            except Exception:
+                pass
             finish = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -826,13 +1366,14 @@ async def api_chat(req: ChatRequest, request: Request):
         max_tokens = req.max_tokens if req.max_tokens is not None else 8192
 
         user_msg_id = str(uuid.uuid4())
-        parent_id = sess["last_assistant_id"]
+        parent_id = sess.get("last_assistant_id") or sess.get("seed_msg_id")
 
         if sess["chat_id"] is None:
-            chat_id, _ = create_chat(token, prompt, model=chat_model, cookie=cookie,
-                                     enable_thinking=req.enable_thinking,
-                                     reasoning_effort=req.reasoning_effort)
+            chat_id, seed_msg_id, *_ = create_chat(token, prompt, model=chat_model, cookie=cookie,
+                                                   enable_thinking=req.enable_thinking,
+                                                   reasoning_effort=req.reasoning_effort)
             sess["chat_id"] = chat_id
+            sess["seed_msg_id"] = seed_msg_id
         else:
             chat_id = sess["chat_id"]
 
@@ -901,11 +1442,8 @@ async def api_chat(req: ChatRequest, request: Request):
                     inner = j.get("data", {})
                     delta = inner.get("delta_content") or ""
                     mid = inner.get("id")
-                    pid = inner.get("parent_id")
                     if mid:
                         new_assistant_id = mid
-                    if pid:
-                        new_assistant_id = pid
                     u = inner.get("usage")
                     if u:
                         usage = u
@@ -922,12 +1460,20 @@ async def api_chat(req: ChatRequest, request: Request):
                 yield "data: [DONE]\n\n"
             finally:
                 text = "".join(collected)
+                sess["history"].append({"role": "user", "content": prompt})
                 if text:
                     sess["history"].append({"role": "assistant", "content": text})
                     sess["last_assistant_id"] = new_assistant_id or sess["last_assistant_id"]
-                    if len(sess["history"]) > MAX_HISTORY * 2:
-                        sess["history"] = sess["history"][-MAX_HISTORY * 2:]
-                    SESSIONS[session_id] = sess
+                if len(sess["history"]) > HISTORY_LIMIT:
+                    sess["history"] = sess["history"][-HISTORY_LIMIT:]
+                SESSIONS[session_id] = sess
+                # discover the server-assigned reply node for next-turn threading
+                if text:
+                    sid2, _ = await _fetch_reply(token, chat_id, cookie,
+                                                 after_user_id=user_msg_id)
+                    if sid2:
+                        sess["last_assistant_id"] = sid2
+                        SESSIONS[session_id] = sess
 
         return StreamingResponse(event_generator(), media_type="text/event-stream",
                                  headers={"X-Session-Id": session_id})

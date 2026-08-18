@@ -51,6 +51,7 @@ def fake_stream_turn(**kwargs):
 
 
 tools.stream_turn = fake_stream_turn
+tools.fetch_reply_node = lambda *a, **k: (None, None)
 
 
 def make_state():

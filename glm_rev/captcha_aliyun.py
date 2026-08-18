@@ -30,15 +30,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # --- Aliyun API credentials (from GLM-Free-API; chat.z.ai scene) ------------
+# Sourced from the repo .env (see .env.example).
 
-ACCESS_KEY = "REDACTED"
-SECRET_KEY = "REDACTED"
+from .config import _require  # noqa: E402  (after load_dotenv in config)
+
+ACCESS_KEY = _require("ALIYUN_ACCESS_KEY")
+SECRET_KEY = _require("ALIYUN_SECRET_KEY")
 SCENE_ID = "didk33e0"
 INIT_URL = "https://no8xfe.captcha-open-southeast.aliyuncs.com/"
 VERIFY_URL = "https://no8xfe-verify.captcha-open-southeast.aliyuncs.com/"
 
-ARG_CONSTANT = "REDACTED"
-ENCRYPT_KEY = "REDACTED"
+ARG_CONSTANT = _require("ALIYUN_ARG_CONSTANT")
+ENCRYPT_KEY = _require("ALIYUN_ENCRYPT_KEY")
 
 ARG_PERM_TABLE = [
     32, 50, 10, 51, 6, 44, 37, 16, 46, 11, 62, 19, 43, 25, 23, 30,
@@ -59,7 +62,7 @@ _IDLE_PAUSE_S = 180.0
 # Minimum spacing between background verify requests. Aliyun risk-control
 # re-flags the device (F001) after ~3 rapid verify calls, so pace generation
 # instead of firing bursts the instant a param is consumed.
-_MIN_GEN_INTERVAL_S = 6.0
+_MIN_GEN_INTERVAL_S = 10.0
 
 # Shared cooldown gate: when a device token is rejected (F001 risk-control
 # flag), all generator threads pause ~35s before trying again instead of
@@ -74,6 +77,14 @@ _FAIL_BACKOFF_UNTIL = 0.0
 # first one and let the device cool down instead of burning the whole batch.
 _F001_PAUSE_S = 300.0
 _F001_UNTIL = 0.0
+
+# F011 = "same-device access frequency exceeded / token desync". Distinct from
+# the F001 risk-control flag (IP-based, ~10 min recovery): frequency windows
+# reset faster, so use a short recoverable pause rather than the 300s F001
+# lockout. Armed on first F011 so the retry-storm (each compute_final = 1
+# verify) stops and the device's frequency window can reset.
+_F011_PAUSE_S = 60.0
+_F011_UNTIL = 0.0
 
 # _compute_with_refill tries at most 3 pool tokens (range(3)) before arming
 # the shared backoff, so a flagged device is never hammered with rapid
@@ -97,11 +108,16 @@ def set_device_collector(cb):
 
 
 def reset_backoff():
-    """Clear the failure cooldown gate (e.g. after a fresh browser harvest)."""
-    global _FAIL_BACKOFF_UNTIL, _F001_UNTIL
+    """Clear the transient failure cooldown after a fresh browser harvest.
+
+    Deliberately does NOT clear the F001/F011 risk-control gates: those flag
+    the device/IP itself (not just a stale token), and a fresh token batch does
+    not unflag it. Clearing them on refill is what let a flagged device be
+    re-verified in a storm, re-arming the flag every few seconds.
+    """
+    global _FAIL_BACKOFF_UNTIL
     with _device_lock:
         _FAIL_BACKOFF_UNTIL = 0.0
-        _F001_UNTIL = 0.0
 
 
 def _collect_device_tokens():
@@ -321,12 +337,20 @@ def verify_captcha(certify_id: str, data_value: str, device_token: str) -> str |
     resp = _http_post(VERIFY_URL, build_query_string(params), {"Referer": ""})
     data = json.loads(resp)
     if not data.get("Success") or not (data.get("Result") or {}).get("VerifyResult"):
-        vcode = (data or {}).get("VerifyCode")
+        # VerifyCode is nested under Result in the live response, but some
+        # responses / unit mocks put it at the top level. Read both.
+        vcode = (data.get("Result") or {}).get("VerifyCode") or (data or {}).get("VerifyCode")
         if vcode == "F001":
             global _F001_UNTIL
             with _device_lock:
                 _F001_UNTIL = time.time() + _F001_PAUSE_S
             print("[verify_captcha] F001 risk-control flag; pausing verifies for 300s",
+                  file=sys.stderr)
+        elif vcode == "F011":
+            global _F011_UNTIL
+            with _device_lock:
+                _F011_UNTIL = time.time() + _F011_PAUSE_S
+            print("[verify_captcha] F011 frequency/desync; pausing verifies for 60s",
                   file=sys.stderr)
         else:
             print(f"[verify_captcha] rejected: {resp[:400]}", file=sys.stderr)
@@ -556,7 +580,8 @@ class CaptchaPool:
         paced = (now - self._last_gen) >= (
             _MIN_GEN_INTERVAL_S + random.uniform(-1.5, 1.5))
         backoff_clear = (now >= _FAIL_BACKOFF_UNTIL
-                         and now >= _F001_UNTIL)
+                         and now >= _F001_UNTIL
+                         and now >= _F011_UNTIL)
         return paced and backoff_clear
 
     def _run(self):
@@ -624,10 +649,10 @@ class CaptchaPool:
                 return payload
             with _device_lock:
                 _FAIL_BACKOFF_UNTIL = time.time() + _FAIL_BACKOFF_S
-            # First F001 arms a 300s process-wide abort: stop the loop NOW
-            # instead of running attempts 2-3 (each extra verify re-arms F001).
+            # First F001/F011 arms a process-wide abort: stop the loop NOW
+            # instead of running attempts 2-3 (each extra verify re-arms it).
             with _device_lock:
-                if time.time() < _F001_UNTIL:
+                if time.time() < _F001_UNTIL or time.time() < _F011_UNTIL:
                     return None
         return None
 

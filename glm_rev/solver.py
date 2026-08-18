@@ -17,7 +17,7 @@ from pathlib import Path
 
 import requests
 
-from .config import BASE, UA
+from .config import BASE, UA, DEVICE_ID
 from .api import user_id_from_token, headers
 from . import captcha_aliyun as ca
 
@@ -319,7 +319,7 @@ async def _oneshot_impl(token: str, count: int) -> list[str]:
             await _wait_for(page, "body", 15000)
             await page.evaluate(
                 f"localStorage.setItem('token', {json.dumps(token)});"
-                "localStorage.setItem('_arms_uid', 'REDACTED');"
+                f"localStorage.setItem('_arms_uid', {json.dumps(DEVICE_ID)});"
                 "localStorage.setItem('last_mode', 'chat');")
             await page.add_init_script(PATCH_JS)
             await page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=40000)
@@ -460,7 +460,8 @@ class CaptchaSolver:
             try:
                 device_token = None
                 if (time.time() >= ca._FAIL_BACKOFF_UNTIL
-                        and time.time() >= ca._F001_UNTIL):
+                        and time.time() >= ca._F001_UNTIL
+                        and time.time() >= ca._F011_UNTIL):
                     device_token = ca.device_tokens.pop()
                 if not device_token and self._page is not None:
                     tokens = self.collect_tokens(token, count=150)
@@ -525,7 +526,7 @@ class CaptchaSolver:
         await _wait_for(page, "body", 15000)
         await page.evaluate(
             f"localStorage.setItem('token', {json.dumps(token)});"
-            "localStorage.setItem('_arms_uid', 'REDACTED');"
+            f"localStorage.setItem('_arms_uid', {json.dumps(DEVICE_ID)});"
             "localStorage.setItem('show_coding_plan_guide', 'false');"
             "localStorage.setItem('last_mode', 'chat');")
         await page.add_init_script(PATCH_JS)
@@ -553,8 +554,8 @@ class CaptchaSolver:
             print(f"[solver] _open harvest raised {type(e).__name__}: {e}", file=sys.stderr)
         # Authoritative in-memory path: compute a fresh captcha from a
         # harvested device token instead of serving the DOM token.
-        if time.time() < ca._F001_UNTIL:
-            print("[solver] _open skipping authoritative compute (F001 pause)",
+        if time.time() < ca._F001_UNTIL or time.time() < ca._F011_UNTIL:
+            print("[solver] _open skipping authoritative compute (F001/F011 pause)",
                   file=sys.stderr)
         else:
             try:

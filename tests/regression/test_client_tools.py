@@ -39,6 +39,11 @@ server.sign = lambda *a, **k: ("sig", "", 123)
 server.user_id_from_token = lambda token: "user_123"
 server.load_mcp_config = lambda: None  # never connect real MCP servers
 
+async def _fake_sync_graph(*a, **k):
+    return (None, None)
+
+server._sync_graph = _fake_sync_graph
+
 
 class _FakeSSEResponse:
     def __init__(self, lines):
@@ -125,7 +130,7 @@ ok_tc = (
     r.status_code == 200
     and len(tool_chunks) >= 1
     and tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
-    and tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_0"
+    and str(tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"]).startswith("call_")
     and tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["type"] == "function"
     and tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "run_command"
 )
@@ -147,7 +152,7 @@ r = client.post("/v1/chat/completions", json=_tool_req(False))
 j = r.json()
 msg = j["choices"][0]["message"]
 tc = msg.get("tool_calls")
-ok = (r.status_code == 200 and tc and tc[0]["id"] == "call_0"
+ok = (r.status_code == 200 and tc and str(tc[0]["id"]).startswith("call_")
       and tc[0]["function"]["name"] == "run_command"
       and j["choices"][0]["finish_reason"] == "tool_calls")
 results.append(check("3. non-stream tool_calls response", ok,
@@ -199,7 +204,7 @@ ok = (r.status_code == 200 and "finish_reason" in j.get("choices", [{}])[0]
 results.append(check("6. role:tool round-trip returns 200", ok,
                       f"http={r.status_code}"))
 
-# 7. Env gate: GLM_CLIENT_TOOLS unset -> client-side mode NOT used
+# 7. Default routing: with no GLM_SERVER_TOOLS env, tools request routes TO client tools.
 server._run_client_tools_called = False
 _orig_run_client_tools = server._run_client_tools
 
@@ -209,21 +214,18 @@ def _record(*a, **k):
 
 server._run_client_tools = _record
 saved_env = os.environ.pop("GLM_CLIENT_TOOLS", None)
+saved_server_env = os.environ.pop("GLM_SERVER_TOOLS", None)
 
-# With env unset, a tools request routes to server-side _run_with_tools. It needs
-# _tool_prompt + send_with_tools; block it so we can prove client-mode was skipped.
-server.send_with_tools = lambda *a, **k: (False, "blocked server-side")
 try:
     r = client.post("/v1/chat/completions", json=_tool_req(False))
-    res = r.json()
-    is_tool_calls = res.get("choices", [{}])[0].get("finish_reason") == "tool_calls" or \
-                    bool(res.get("choices", [{}])[0].get("message", {}).get("tool_calls"))
-    results.append(check("7. env-unset routes AWAY from client tools",
-                          server._run_client_tools_called is False and is_tool_calls is False,
-                          f"client_called={server._run_client_tools_called} tool_calls_resp={is_tool_calls} http={r.status_code}"))
+    results.append(check("7. env-unset defaults TO client tools",
+                          server._run_client_tools_called is True,
+                          f"client_called={server._run_client_tools_called} http={r.status_code}"))
 finally:
     if saved_env is not None:
         os.environ["GLM_CLIENT_TOOLS"] = saved_env
+    if saved_server_env is not None:
+        os.environ["GLM_SERVER_TOOLS"] = saved_server_env
     server._run_client_tools = _orig_run_client_tools
     del server.send_with_tools
 

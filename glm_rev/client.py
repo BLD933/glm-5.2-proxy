@@ -57,6 +57,20 @@ def stream_turn(*, token, cookie, sig, url, chat_id, model, messages,
     if is_first:
         body["background_tasks"] = {"title_generation": True, "tags_generation": True}
     try:
+        _dbg = open("/tmp/glm_upstream_debug.log", "a")
+        _dbg.write("===== TOOLS-PATH UPSTREAM REQUEST =====\n")
+        _dbg.write(f"chat_id: {body.get('chat_id')}\n")
+        _dbg.write(f"current_user_message_id: {body.get('current_user_message_id')}\n")
+        _dbg.write(f"current_user_message_parent_id: {body.get('current_user_message_parent_id')}\n")
+        _dbg.write(f"signature_prompt: {body.get('signature_prompt')!r}\n")
+        _dbg.write("messages:\n")
+        for _fm in body.get("messages", []):
+            _dbg.write(f"  role={_fm.get('role')} content={_fm.get('content')!r}\n")
+        _dbg.write("==========================================\n")
+        _dbg.close()
+    except Exception:
+        pass
+    try:
         resp = _HTTP.post(url, headers=headers(token, sig, cookie), json=body,
                              stream=True, timeout=60)
     except requests.exceptions.RequestException as e:
@@ -94,6 +108,12 @@ def stream_turn(*, token, cookie, sig, url, chat_id, model, messages,
             inner = j.get("data")
             if not isinstance(inner, dict):
                 continue
+            try:
+                _dbg = open("/tmp/glm_upstream_debug.log", "a")
+                _dbg.write(f"[TOOLS-SSE] {json.dumps(inner)[:400]}\n")
+                _dbg.close()
+            except Exception:
+                pass
             phase = inner.get("phase")
             delta = inner.get("delta_content")
             edit_index = inner.get("edit_index")
@@ -182,24 +202,15 @@ def refresh_token(token: str) -> str:
     return token
 
 
-def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = None,
-                chat_id: str = None, msg_id: str = None,
-                enable_thinking: bool = True, reasoning_effort: str = "max",
-                messages: list = None) -> tuple[str, str]:
-    """Create (or reuse) an upstream conversation.
+def _build_nodes(model, messages, msg_id=None):
+    """Build the linked-list node tree for a chat history payload.
 
-    `messages` is an optional list of {"role": "user"|"assistant", "content":
-    str} dicts. When given, the full linked-list message tree (parentId /
-    childrenIds / currentId) is seeded so the upstream conversation carries
-    the complete prior context, not just the latest prompt. Otherwise a single
-    user node is created from `prompt` (backward compatible). Returns
-    (chat_id, last_msg_id) where last_msg_id is the id of the final message
-    node, suitable for threading the first streamed turn."""
-    chat_id = chat_id or str(uuid.uuid4())
+    Returns (nodes, last_id, last_parent). With `messages`, one node per entry;
+    otherwise a single user node seeded from `msg_id` (generated when absent)."""
     ts2 = int(time.time())
-
     nodes = {}
     parent = None
+    last_parent = None
     last_id = None
     if messages:
         for i, m in enumerate(messages):
@@ -215,6 +226,7 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             }
             if parent is not None:
                 nodes[parent]["childrenIds"].append(mid)
+            last_parent = parent
             parent = mid
             last_id = mid
     else:
@@ -224,14 +236,18 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             "parentId": None,
             "childrenIds": [],
             "role": "user",
-            "content": prompt,
+            "content": "",
             "timestamp": ts2,
             "models": [model],
         }
         parent = msg_id
         last_id = msg_id
+        last_parent = None
+    return nodes, last_id, last_parent
 
-    chat_body = {
+
+def _chat_payload(chat_id, model, nodes, last_id, enable_thinking, reasoning_effort):
+    return {
         "chat": {
             "id": chat_id,
             "title": "New Chat",
@@ -239,7 +255,7 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             "params": {},
             "history": {
                 "messages": nodes,
-                "currentId": parent,
+                "currentId": last_id,
             },
             "tags": [],
             "flags": [],
@@ -254,6 +270,82 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             "type": "default",
         }
     }
+
+
+def fetch_reply_node(token, chat_id, after_user_id=None, cookie=None):
+    """GET the stored graph and return the assistant reply node id for the
+    last streamed turn.
+
+    chat.z.ai's SSE stream usually omits the stored assistant node id, yet
+    follow-up turns MUST be parented at it — verified live 2026-08-16 with a
+    3-arm probe: a turn anchored under the server-assigned reply node recalls
+    full context, while turns anchored under POST /chats/<id>-rewritten ids
+    (or stale anchors) come back DEAF (the completions backend only trusts
+    node lineages it streamed/created itself; POSTed graphs poison recall).
+    So the threading fix is: after a streamed turn, learn the reply node via
+    GET and use it as the next request's current_user_message_parent_id.
+
+    Discovery: prefer the assistant child of `after_user_id`; else the
+    deepest assistant node on the root->leaf chain. Returns
+    (assistant_id, None) or (None, None) on failure."""
+    try:
+        r = _HTTP.get(f"{BASE}/api/v1/chats/{chat_id}",
+                      headers=headers(token, cookie=cookie), timeout=15)
+    except requests.exceptions.RequestException:
+        return None, None
+    if r.status_code != 200:
+        return None, None
+    try:
+        hist = r.json().get("chat", {}).get("history", {}) or {}
+    except Exception:
+        return None, None
+    msgs = hist.get("messages") or {}
+    if not msgs:
+        return None, None
+    if after_user_id and after_user_id in msgs:
+        parent = msgs[after_user_id].get("parentId")
+        for child in (msgs[after_user_id].get("childrenIds") or []):
+            n = msgs.get(child)
+            if n and n.get("role") == "assistant":
+                return child, parent
+    roots = [mid for mid, n in msgs.items() if not n.get("parentId")]
+    cur = roots[0] if roots else None
+    deepest = None
+    parent_of = {}
+    while cur and cur in msgs:
+        n = msgs[cur]
+        if n.get("role") == "assistant":
+            deepest = cur
+        children = n.get("childrenIds") or []
+        nxt = children[0] if children else None
+        if nxt:
+            parent_of[nxt] = cur
+        cur = nxt
+    if deepest:
+        return deepest, parent_of.get(deepest)
+    return None, None
+
+
+def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = None,
+                chat_id: str = None, msg_id: str = None,
+                enable_thinking: bool = True, reasoning_effort: str = "max",
+                messages: list = None) -> tuple[str, str]:
+    """Create (or reuse) an upstream conversation.
+
+    `messages` is an optional list of {"role": "user"|"assistant", "content":
+    str} dicts. When given, the full linked-list message tree (parentId /
+    childrenIds / currentId) is seeded so the upstream conversation carries
+    the complete prior context, not just the latest prompt. Otherwise a single
+    user node is created from `prompt` (backward compatible). Returns
+    (chat_id, last_msg_id) where last_msg_id is the id of the final message
+    node, suitable for threading the first streamed turn."""
+    chat_id = chat_id or str(uuid.uuid4())
+    nodes, last_id, last_parent = _build_nodes(model, messages, msg_id)
+    if not messages:
+        nodes[last_id]["content"] = prompt
+
+    chat_body = _chat_payload(chat_id, model, nodes, last_id,
+                              enable_thinking, reasoning_effort)
     r = _HTTP.post(f"{BASE}/api/v1/chats/new", json=chat_body,
                       headers=headers(token, cookie=cookie), timeout=20)
     if r.status_code == 200:
@@ -261,7 +353,7 @@ def create_chat(token: str, prompt: str, model: str = "glm-5.2", cookie: str = N
             chat_id = r.json().get("id", chat_id)
         except Exception:
             pass
-    return chat_id, last_id
+    return chat_id, last_id, last_parent
 
 
 def chat(prompt: str, token: str, model: str = "glm-5.2", chat_id: str = None,
@@ -272,9 +364,9 @@ def chat(prompt: str, token: str, model: str = "glm-5.2", chat_id: str = None,
     token = refresh_token(token)
     msg_id = None
     if create_session:
-        chat_id, msg_id = create_chat(token, prompt, model, cookie, chat_id,
-                                      enable_thinking=enable_thinking,
-                                      reasoning_effort=reasoning_effort)
+        chat_id, msg_id, *_ = create_chat(token, prompt, model, cookie, chat_id,
+                                          enable_thinking=enable_thinking,
+                                          reasoning_effort=reasoning_effort)
     sig, url_params, ts = sign(prompt, user_id_from_token(token), token,
                                current_url=f"{BASE}/chat/{chat_id}")
     url = f"{BASE}{ENDPOINT}?{url_params}&signature_timestamp={ts}"

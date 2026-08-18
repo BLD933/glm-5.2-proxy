@@ -80,7 +80,7 @@ def test_a():
             {"role": "user", "content": "m2"},
             {"role": "user", "content": "current prompt"},
         ]
-        chat_id, last_id = create_chat("tok", "current prompt", messages=msgs)
+        chat_id, last_id, last_parent = create_chat("tok", "current prompt", messages=msgs)
         body = fake.calls[0]["body"]
         hist = body["chat"]["history"]
         nodes = hist["messages"]
@@ -93,8 +93,8 @@ def test_a():
             cur = n["childrenIds"][0] if n["childrenIds"] else None
 
         check("A1 chat_id=='chat_abc' and last_id==4th node id",
-              chat_id == "chat_abc" and last_id == chain[3]["id"],
-              repr((chat_id, last_id, chain[3]["id"])))
+              chat_id == "chat_abc" and last_id == chain[3]["id"] and last_parent == chain[2]["id"],
+              repr((chat_id, last_id, chain[3]["id"], last_parent)))
         check("A2 exactly 4 nodes", len(nodes) == 4, repr(len(nodes)))
         check("A3 chain integrity (parentId/childrenIds/root/leaf)",
               (chain[0]["parentId"] is None
@@ -108,7 +108,7 @@ def test_a():
         ts = [n["timestamp"] for n in chain]
         check("A6 timestamps strictly increasing", all(ts[i] < ts[i + 1] for i in range(3)), repr(ts))
 
-        _, last_id2 = create_chat("tok", "single prompt")
+        _, last_id2, parent2 = create_chat("tok", "single prompt")
         body2 = fake.calls[1]["body"]
         hist2 = body2["chat"]["history"]
         nodes2 = list(hist2["messages"].values())
@@ -117,8 +117,9 @@ def test_a():
                and nodes2[0]["role"] == "user"
                and nodes2[0]["content"] == "single prompt"
                and hist2["currentId"] == nodes2[0]["id"]
-               and last_id2 == nodes2[0]["id"]),
-              repr((len(nodes2), nodes2[0]["role"], nodes2[0]["content"], hist2["currentId"], last_id2)))
+               and last_id2 == nodes2[0]["id"]
+               and parent2 is None),
+              repr((len(nodes2), nodes2[0]["role"], nodes2[0]["content"], hist2["currentId"], last_id2, parent2)))
     finally:
         client._HTTP = real
 
@@ -134,16 +135,18 @@ def test_b():
         Message(role="tool", tool_call_id="call_9", content="42"),
         Message(role="user", content="what did i say first?"),
     ])
+    # system/developer directives are retained as a leading user message (Bug 1 fix)
     expected = [
+        {"role": "user", "content": "sys"},
         {"role": "user", "content": "first?"},
         {"role": "assistant", "content": "first answer"},
         {"role": "user", "content": "[Tool result for call_9]: 42"},
         {"role": "user", "content": "what did i say first?"},
     ]
     sanitized = _tool_messages(req)
-    check("B1 _tool_messages drops system, sanitizes roles/contents", sanitized == expected, repr(sanitized))
+    check("B1 _tool_messages retains system directive, sanitizes roles/contents", sanitized == expected, repr(sanitized))
     check("B2 _tool_state history == messages before last user",
-          _tool_state(req, "tok")["history"] == expected[:3],
+          _tool_state(req, "tok")["history"] == expected[:4],
           repr(_tool_state(req, "tok")["history"]))
     check("B3 _tool_prompt == last user message content",
           _tool_prompt(req) == "what did i say first?", repr(_tool_prompt(req)))

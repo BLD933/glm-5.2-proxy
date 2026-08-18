@@ -1,0 +1,6 @@
+.env
+zai/token.txt
+zai/device_tokens.txt
+__pycache__/
+*.pyc
+.pytest_cache/

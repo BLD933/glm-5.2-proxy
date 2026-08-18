@@ -32,12 +32,21 @@ for f in tests/regression/test_fix1.py tests/regression/test_fix2.py \
 done
 run tests/regression/test_contract.py
 run tests/regression/test_client_tools.py "GLM_CLIENT_TOOLS=1"
+run tests/regression/test_stream_granularity.py "GLM_CLIENT_TOOLS=1"
+run tests/regression/test_tool_detection.py "GLM_CLIENT_TOOLS=1"
+run tests/regression/test_parallel_tools.py "GLM_CLIENT_TOOLS=1"
 run tests/regression/test_refusal.py
 run tests/regression/test_history_commit.py
 run tests/regression/test_inflight_hist.py
 run tests/regression/test_memory.py
+run tests/regression/test_universal_memory.py
+run tests/regression/test_multi_turn_memory_full.py
 run tests/regression/test_jitter.py
 run tests/regression/test_masking.py
+run tests/regression/test_glm_native_mapping.py
+run tests/regression/test_refusal_transparent_nudge.py
+run tests/regression/test_repl_style_contract.py
+run tests/regression/test_graph_reseed.py
 
 if [ $FAILED -ne 0 ]; then
   echo "=== SOME TESTS FAILED ==="

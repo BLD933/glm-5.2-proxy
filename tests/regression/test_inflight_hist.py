@@ -57,6 +57,7 @@ tools.create_chat = lambda *a, **k: ("chat_1", "msg_1")
 tools.sign = lambda *a, **k: ("sig", "", 123)
 tools.build_features = lambda *a, **k: {}
 tools.stream_turn = fake_stream_turn
+tools.fetch_reply_node = lambda *a, **k: (None, None)
 tools.dispatch_tool = lambda name, args, mcp=None: (True, "mock listing")
 tools.approve_tool = lambda name, args: name == "list_dir"
 

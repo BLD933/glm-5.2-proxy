@@ -255,14 +255,16 @@ def main():
           f"payload={payload!r} armed={armed} calls={f001_calls!r}")
     assert payload is None and armed and len(f001_calls) == 1, "S10 regression"
 
-    # ---- Scenario 11: reset_backoff clears the F001 gate too (fresh harvest
-    # can lift the abort).
+    # ---- Scenario 11: reset_backoff clears the TRANSIENT backoff but
+    # PRESERVES the F001 risk-control gate (a fresh harvest does not unflag a
+    # flagged device; clearing it on refill caused the verify storm).
     ca._F001_UNTIL = time.time() + 100.0
+    ca._FAIL_BACKOFF_UNTIL = time.time() + 100.0
     ca.reset_backoff()
-    check("S11 reset_backoff clears _F001_UNTIL",
-          ca._F001_UNTIL == 0.0 and ca._FAIL_BACKOFF_UNTIL == 0.0,
+    check("S11 reset_backoff clears transient, preserves _F001_UNTIL",
+          ca._FAIL_BACKOFF_UNTIL == 0.0 and ca._F001_UNTIL > time.time(),
           f"f001={ca._F001_UNTIL!r} backoff={ca._FAIL_BACKOFF_UNTIL!r}")
-    assert ca._F001_UNTIL == 0.0, "S11 regression"
+    assert ca._FAIL_BACKOFF_UNTIL == 0.0 and ca._F001_UNTIL > time.time(), "S11 regression"
 
     # ---- Scenario 12: the _run gate (backoff_clear expression) blocks
     # generator spawn while _F001_UNTIL is in the future.
@@ -305,6 +307,89 @@ def main():
           out == ("PAYLOAD", None) and len(open_calls) == 1,
           f"out={out!r} calls={open_calls!r}")
     assert out == ("PAYLOAD", None) and len(open_calls) == 1, "S13b regression"
+
+    # ---- Scenario F1: verify_captcha on F011 returns None, arms the
+    # recoverable _F011_UNTIL (60s), and leaves the 300s _F001_UNTIL untouched.
+    # VerifyCode is nested under Result (real live response shape).
+    ca._F001_UNTIL = 0.0
+    ca._F011_UNTIL = 0.0
+
+    def fake_http_f011(url, body, extra_headers=None, retries=3):
+        return json.dumps({"Success": True, "Result": {"VerifyResult": False,
+                           "VerifyCode": "F011", "certifyId": "x"}})
+
+    ca._http_post = fake_http_f011
+    out = ca.verify_captcha("cid", "dv", "tok")
+    check("F1 F011 arms _F011_UNTIL, returns None, leaves _F001_UNTIL",
+          out is None and ca._F011_UNTIL > time.time() and ca._F001_UNTIL == 0.0,
+          f"out={out!r} f011={ca._F011_UNTIL!r} f001={ca._F001_UNTIL!r}")
+    assert out is None and ca._F011_UNTIL > time.time() and ca._F001_UNTIL == 0.0, "F1 regression"
+
+    # ---- Scenario F1b: F011 reported at the TOP level (legacy/unit-mock shape)
+    # is still recognized via the fallback lookup.
+    ca._F001_UNTIL = 0.0
+    ca._F011_UNTIL = 0.0
+
+    def fake_http_f011_top(url, body, extra_headers=None, retries=3):
+        return json.dumps({"Success": True, "Result": {"VerifyResult": False},
+                           "VerifyCode": "F011", "CertifyId": "x"})
+
+    ca._http_post = fake_http_f011_top
+    out = ca.verify_captcha("cid", "dv", "tok")
+    check("F1b F011 top-level VerifyCode also arms _F011_UNTIL",
+          out is None and ca._F011_UNTIL > time.time(),
+          f"out={out!r} f011={ca._F011_UNTIL!r}")
+    assert out is None and ca._F011_UNTIL > time.time(), "F1b regression"
+
+    # ---- Scenario F1c: F001 nested under Result also arms the 300s gate.
+    ca._F001_UNTIL = 0.0
+    ca._F011_UNTIL = 0.0
+
+    def fake_http_f001_nested(url, body, extra_headers=None, retries=3):
+        return json.dumps({"Success": True, "Result": {"VerifyResult": False,
+                           "VerifyCode": "F001", "certifyId": "x"}})
+
+    ca._http_post = fake_http_f001_nested
+    out = ca.verify_captcha("cid", "dv", "tok")
+    check("F1c F001 nested under Result arms _F001_UNTIL",
+          out is None and ca._F001_UNTIL > time.time() and ca._F011_UNTIL == 0.0,
+          f"out={out!r} f001={ca._F001_UNTIL!r} f011={ca._F011_UNTIL!r}")
+    assert out is None and ca._F001_UNTIL > time.time() and ca._F011_UNTIL == 0.0, "F1c regression"
+
+
+    # ---- Scenario F2: first F011 arms _F011_UNTIL -> _compute_with_refill
+    # aborts after exactly one attempt (no retry-storm of verifies).
+    ca._F001_UNTIL = 0.0
+    ca._F011_UNTIL = 0.0
+    ca._FAIL_BACKOFF_UNTIL = 0.0
+    f011_calls = []
+
+    def f011_compute(token):
+        f011_calls.append(token)
+        with ca._device_lock:
+            ca._F011_UNTIL = time.time() + ca._F011_PAUSE_S
+        return None
+
+    ca.device_tokens = _FakeTokens("f1", "f2", "f3")
+    ca._collect_device_tokens = _fresh_collect_none
+    ca.compute_final = f011_compute
+    payload = pool._compute_with_refill()
+    check("F2 first-F011 aborts loop after one attempt",
+          payload is None and len(f011_calls) == 1,
+          f"payload={payload!r} calls={f011_calls!r}")
+    assert payload is None and len(f011_calls) == 1, "F2 regression"
+
+    # ---- Scenario F3: reset_backoff clears transient but PRESERVES the F011
+    # risk-control gate (same reasoning as S11).
+    ca._F011_UNTIL = time.time() + 100.0
+    ca._FAIL_BACKOFF_UNTIL = time.time() + 100.0
+    ca.reset_backoff()
+    check("F3 reset_backoff preserves _F011_UNTIL, clears transient",
+          ca._FAIL_BACKOFF_UNTIL == 0.0 and ca._F011_UNTIL > time.time(),
+          f"f011={ca._F011_UNTIL!r} backoff={ca._FAIL_BACKOFF_UNTIL!r}")
+    assert ca._FAIL_BACKOFF_UNTIL == 0.0 and ca._F011_UNTIL > time.time(), "F3 regression"
+
+    ca._F011_UNTIL = 0.0
 
     ca._FAIL_BACKOFF_UNTIL = old_backoff
     ca._F001_UNTIL = 0.0
